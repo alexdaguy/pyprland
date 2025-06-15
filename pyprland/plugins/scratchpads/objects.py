@@ -2,6 +2,7 @@
 
 __all__ = ["Scratch"]
 
+import asyncio
 import logging
 import os
 from dataclasses import dataclass, field
@@ -61,10 +62,10 @@ class Scratch(CastBoolMixin):  # {{{
         """Returns forced monitor if available, else None."""
         forced_monitor = self.conf.get("force_monitor")
         if forced_monitor in state.monitors:
-            return cast(str, forced_monitor)
+            return cast("str", forced_monitor)
         return None
 
-    def _make_intial_config(self, config: dict) -> dict:
+    def _make_initial_config(self, config: dict) -> dict:
         """Return configuration for the scratchpad."""
         opts = {}
         scratch_config = config[self.uid]
@@ -84,7 +85,7 @@ class Scratch(CastBoolMixin):  # {{{
 
     def set_config(self, full_config: dict[str, Any]) -> None:
         """Apply constraints to the configuration."""
-        opts = self._make_intial_config(full_config)
+        opts = self._make_initial_config(full_config)
 
         # apply the config
         self.conf = DynMonitorConfig(opts, opts.get("monitor", {}))
@@ -98,6 +99,8 @@ class Scratch(CastBoolMixin):  # {{{
             opts["lazy"] = True
             if "match_by" not in opts:
                 opts["match_by"] = "class"
+        if opts.get("close_on_hide", False):
+            opts["lazy"] = True
         if state.hyprland_version < VersionInfo(0, 39, 0):
             opts["allow_special_workspace"] = False
 
@@ -122,6 +125,7 @@ class Scratch(CastBoolMixin):  # {{{
                 self.client_info = m_client
             assert self.client_info, "couldn't find a matching client"
         await ex.hyprctl(f"movetoworkspacesilent special:scratch_{self.uid},address:{self.full_address}")
+        await asyncio.sleep(0.05)  # workaround
         self.meta.initialized = True
 
     async def is_alive(self) -> bool:
@@ -172,7 +176,7 @@ class Scratch(CastBoolMixin):  # {{{
     @property
     def full_address(self) -> str:
         """Return the client address."""
-        return cast(str, self.client_info.get("address", ""))
+        return cast("str", self.client_info.get("address", ""))
 
     async def update_client_info(
         self,

@@ -23,7 +23,9 @@ CONTROL = f"{IPC_FOLDER}/.pyprland.sock"
 OLD_CONFIG_FILE = "~/.config/hypr/pyprland.json"
 CONFIG_FILE = "~/.config/hypr/pyprland.toml"
 
-PYPR_DEMO = os.environ.get("PYPR_DEMO", False)
+TASK_TIMEOUT = 35.0
+
+PYPR_DEMO = os.environ.get("PYPR_DEMO")
 
 __all__: list[str] = []
 
@@ -39,14 +41,14 @@ def remove_duplicate(names: list[str]) -> Callable:
     def _remove_duplicates(fn: Callable) -> Callable:
         """Wrapper for the decorator."""
 
-        async def _wrapper(self: Self, full_name: str, *args, **kwargs) -> bool:
+        async def _wrapper(self: "Pyprland", full_name: str, *args, **kwargs) -> bool:
             """Wrapper for the function."""
             if full_name in names:
                 key = (full_name, args)
                 if key == _dedup_last_call.get(full_name):
                     return True
                 _dedup_last_call[full_name] = key
-            return cast(bool, await fn(self, full_name, *args, **kwargs))
+            return cast("bool", await fn(self, full_name, *args, **kwargs))
 
         return _wrapper
 
@@ -170,7 +172,7 @@ class Pyprland:
             if init:
                 try:
                     await self.plugins[name].load_config(self.config)
-                    await asyncio.wait_for(self.plugins[name].on_reload(), timeout=5.0)
+                    await asyncio.wait_for(self.plugins[name].on_reload(), timeout=TASK_TIMEOUT / 2)
                 except TimeoutError:
                     self.plugins[name].log.info("timed out on reload")
                 except Exception as e:
@@ -253,54 +255,67 @@ class Pyprland:
 
     async def exit_plugins(self) -> None:
         """Exit all plugins."""
-        for plugin in self.plugins.values():
-            if not plugin.aborted:
-                plugin.aborted = True
-                await asyncio.wait_for(plugin.exit(), timeout=2.0)
+        active_plugins = (p.exit() for p in self.plugins.values() if not p.aborted)
+        await asyncio.wait_for(asyncio.gather(*active_plugins), timeout=TASK_TIMEOUT / 2)
+
+    async def _abort_plugins(self, writer: asyncio.StreamWriter) -> None:
+        await self.exit_plugins()
+        # cancel the task group
+        for task in self.tasks:
+            task.cancel()
+        writer.close()
+        await writer.wait_closed()
+        for q in self.queues.values():
+            await q.put(None)
+        self.server.close()
+        # Ensure the process exits
+        await asyncio.sleep(1)
+        if os.path.exists(CONTROL):
+            os.unlink(CONTROL)
+        os._exit(0)
 
     async def read_command(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         """Receive a socket command."""
         data = (await reader.readline()).decode()
+        processed = False
+
         if not data:
             self.log.warning("Empty command received")
-            return
-        data = data.strip()
-        if data == "exit":
-
-            async def _abort() -> None:
-                await self.exit_plugins()
-                # cancel the task group
-                for task in self.tasks:
-                    task.cancel()
-                writer.close()
-                await writer.wait_closed()
-                for q in self.queues.values():
-                    await q.put(None)
-                self.server.close()
-                # Ensure the process exits
-                await asyncio.sleep(1)
-                if os.path.exists(CONTROL):
-                    os.unlink(CONTROL)
-                os._exit(0)
-
-            self.stopped = True
-            asyncio.create_task(_abort())
-            return
-        args = data.split(None, 1)
-        if len(args) == 1:
-            cmd = args[0]
-            args = []
+            processed = True
         else:
-            cmd = args[0]
-            args = args[1:]
+            data = data.strip()
 
-        full_name = f"run_{cmd}"
+        if data == "exit":
+            self.stopped = True
+            asyncio.create_task(self._abort_plugins(writer))
+            processed = True
+        if data == "version":
+            writer.write(f"{VERSION}\n".encode())
+        elif data == "dumpjson":
+            writer.write(json.dumps(self.config, indent=2).encode())
+        elif data == "help":
+            txt = get_help(self)
+            writer.write(txt.encode("utf-8"))
+        elif not processed:
+            args = data.split(None, 1)
+            if len(args) == 1:
+                cmd = args[0]
+                args = []
+            else:
+                cmd = args[0]
+                args = args[1:]
 
-        if PYPR_DEMO:
-            os.system(f"notify-send -t 4000 '{data}'")  # noqa: ASYNC221
+            full_name = f"run_{cmd}"
 
-        if not await self._call_handler(full_name, *args, notify=cmd):
-            self.log.warning("No such command: %s", cmd)
+            if PYPR_DEMO:
+                os.system(f"notify-send -t 4000 '{data}'")  # noqa: ASYNC221
+
+            if not await self._call_handler(full_name, *args, notify=cmd):
+                self.log.warning("No such command: %s", cmd)
+
+        writer.write(b"\n")
+        await writer.drain()
+        writer.close()
 
     async def serve(self) -> None:
         """Run the server."""
@@ -325,7 +340,7 @@ class Pyprland:
                 self.log.exception("Aborting [%s] loop", name)
                 return
             try:
-                await asyncio.wait_for(task(), timeout=12.0)
+                await asyncio.wait_for(task(), timeout=TASK_TIMEOUT)
             except TimeoutError:
                 self.log.exception("Timeout running plugin %s::%s", name, task)
             except Exception:  # pylint: disable=W0718
@@ -374,7 +389,7 @@ async def run_daemon() -> None:
     if events_reader is None:
         manager.log.critical("Failed to open hyprland event stream: %s.", events_writer)
         await notify_fatal("Failed to open hyprland event stream")
-        raise PyprError from cast(Exception, events_writer)
+        raise PyprError from cast("Exception", events_writer)
 
     manager.event_reader = events_reader
 
@@ -397,47 +412,43 @@ async def run_daemon() -> None:
         await manager.server.wait_closed()
 
 
-def show_help(manager: Pyprland) -> None:
-    """Show the documentation."""
-
-    def format_doc(txt: str) -> str:
-        return txt.split("\n")[0]
-
-    print(
-        """Syntax: pypr [command]
-
-If the command is omitted, runs the daemon which will start every configured plugin.
-
-Available commands:
-"""
-    )
-    builtins_docs = {
+def get_commands_help(manager: Pyprland) -> dict:
+    docs = {
+        "edit": "Edit the configuration file. (not in pypr-client)",
         "dumpjson": "Dump the configuration in JSON format.",
-        "edit": "Edit the configuration file.",
         "exit": "Exit the daemon.",
         "help": "Show this help.",
         "version": "Show the version.",
     }
-    for name, doc in builtins_docs.items():
-        print(f" {name:20s} {doc}")
-
     for plug in manager.plugins.values():
         for name in dir(plug):
             if not name.startswith("run_"):
                 continue
             fn = getattr(plug, name)
             if callable(fn):
-                doc_txt = format_doc(fn.__doc__) if fn.__doc__ else "N/A"
-                print(f" {name[4:]:20s} {doc_txt} [{plug.name}]")
+                doc_txt = fn.__doc__ or "N/A"
+                docs[name[4:]] = f"{doc_txt} [{plug.name}]"
+    return docs
+
+
+def get_help(manager: Pyprland) -> str:
+    """Get the documentation."""
+    intro = """Syntax: pypr [command]
+
+If the command is omitted, runs the daemon which will start every configured plugin.
+
+Available commands:
+"""
+
+    def keep_first_line(txt: str) -> str:
+        return txt.split("\n", 1)[0]
+
+    return intro + "\n".join(f" {name:20s} {keep_first_line(doc)}" for name, doc in get_commands_help(manager).items())
 
 
 async def run_client() -> None:
     """Run the client (CLI)."""
     manager = Pyprland()
-
-    if sys.argv[1] == "version":
-        print(VERSION)
-        return None
 
     if sys.argv[1] == "edit":
         editor = os.environ.get("EDITOR", os.environ.get("VISUAL", "vi"))
@@ -445,18 +456,11 @@ async def run_client() -> None:
         run_interactive_program(f'{editor} "{filename}"')
         sys.argv[1] = "reload"
 
-    if sys.argv[1] in {"--help", "-h", "help"}:
-        await manager.load_config(init=False)
-        return show_help(manager)
-
-    if sys.argv[1] in ("dumpjson"):
-        await manager.load_config(init=False)
-        # Dump manager.config in TOML format
-        print(json.dumps(manager.config, indent=2))
-        return None
+    elif sys.argv[1] in {"--help", "-h"}:
+        sys.argv[1] = "help"
 
     try:
-        _, writer = await asyncio.open_unix_connection(CONTROL)
+        reader, writer = await asyncio.open_unix_connection(CONTROL)
     except (ConnectionRefusedError, FileNotFoundError) as e:
         manager.log.critical("Failed to open control socket, is pypr daemon running ?")
         await notify_error("Pypr can't connect, is daemon running ?")
@@ -465,7 +469,10 @@ async def run_client() -> None:
     args = sys.argv[1:]
     args[0] = args[0].replace("-", "_")
     writer.write((" ".join(args)).encode())
+    writer.write_eof()
     await writer.drain()
+    return_value = await reader.read()
+    print(return_value.decode("utf-8"))
     writer.close()
     await writer.wait_closed()
 
