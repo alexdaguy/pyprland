@@ -87,7 +87,7 @@ class RofiMenu(MenuEngine):
     """A rofi based menu."""
 
     proc_name = "rofi"
-    proc_extra_parameters = "-dmenu -matching fuzzy -i -p '[prompt]'"
+    proc_extra_parameters = "-dmenu -i -p '[prompt]'"
 
 
 class WofiMenu(MenuEngine):
@@ -111,6 +111,13 @@ class BemenuMenu(MenuEngine):
     proc_extra_parameters = "-c"
 
 
+class FuzzelMenu(MenuEngine):
+    """A fuzzel based menu."""
+
+    proc_name = "fuzzel"
+    proc_extra_parameters = "--match-mode=fuzzy -d -p '[prompt]'"
+
+
 class WalkerMenu(MenuEngine):
     """A walker based menu."""
 
@@ -125,7 +132,7 @@ class AnyrunMenu(MenuEngine):
     proc_extra_parameters = "--plugins libstdin.so --show-results-immediately true"
 
 
-every_menu_engine = [WalkerMenu, TofiMenu, RofiMenu, WofiMenu, BemenuMenu, DmenuMenu, AnyrunMenu]
+every_menu_engine = [FuzzelMenu, TofiMenu, RofiMenu, WofiMenu, BemenuMenu, DmenuMenu, AnyrunMenu, WalkerMenu]
 
 
 async def init(force_engine: str | None = None, extra_parameters: str = "") -> MenuEngine:
