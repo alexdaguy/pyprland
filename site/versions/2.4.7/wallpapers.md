@@ -1,17 +1,15 @@
 ---
 commands:
     - name: wall next
-      description: Changes the current background image, resume cycling if paused
+      description: Changes the current background image
     - name: wall clear
-      description: Removes the current background image and pause cycling
-    - name: wall pause
-      description: Stop cycling the wallpaper after a delay
+      description: Removes the current background image
 ---
 
 # wallpapers
 
 Search folders for images and sets the background image at a regular interval.
-Pictures are selected randomly from the full list of images found.
+Images are selected randomly from the full list of images found.
 
 It serves two purposes:
 
@@ -28,7 +26,7 @@ It allows "zapping" current backgrounds, clearing it to go distraction free and 
 
 ```toml
 [wallpapers]
-path = "~/Pictures/wallpapers/" # path to the folder with background images
+path = "~/Images/wallpapers/" # path to the folder with background images
 ```
 
 </details>
@@ -39,7 +37,7 @@ path = "~/Pictures/wallpapers/" # path to the folder with background images
 ```toml
 [wallpapers]
 unique = true # set a different wallpaper for each screen
-path = "~/Pictures/wallpapers/"
+path = "~/Images/wallpapers/"
 interval = 60 # change every hour
 extensions = ["jpg", "jpeg"]
 recurse = true
@@ -64,7 +62,7 @@ Note that for applications like `swww`, you'll need to start a daemon separately
 path to a folder or list of folders that will be searched. Can also be a list, eg:
 
 ```toml
-path = ["~/Pictures/Portraits/", "~/Pictures/Landscapes/"]
+path = ["~/Images/Portraits/", "~/Images/Landscapes/"]
 ```
 
 ### `interval`
@@ -78,10 +76,10 @@ How long (in minutes) a background should stay in place
 
 Overrides the default command to set the background image.
 
-[variables](./Variables) are replaced with the appropriate values, you must use a `"[file]"` placeholder for the image path and `"[output]"` for the screen. eg:
+[variables](./Variables) are replaced with the appropriate values, you must use a `"[file]"` placeholder for the image path. eg:
 
 ```
-swaybg -m fill -i '[file]' -o '[output]'
+swaybg -m fill -i "[file]"
 ```
 
 ### `clear_command`
@@ -92,26 +90,7 @@ Instead of that, you can provide a command to clear the background. eg:
 
 ```
 clear_command = "swaybg clear"
-```
-
-### `post_command`
-
-Executes a command after a wallpaper change. Can use `[file]`, eg:
-
-```
-post_command = "matugen image '[file]'"
-```
-
-### `radius`
-
-When set, adds rounded borders to the wallpapers. Expressed in pixels. Disabled by default.
-
-For this feature to work, you must use '[output]' in your `command` to specify the screen port name to use in the command.
-
-eg:
-```
-radius = 16
-```
+``````
 
 ### `extensions`
 

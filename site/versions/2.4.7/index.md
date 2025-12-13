@@ -28,10 +28,4 @@ features:
     details: Designed for performance and simplicity
 ---
 
-## What is Pyprland?
-
-It's a software that extends the functionality of the great [Hyprland](https://hyprland.org/) window manager, adding new features and improving the existing ones.
-
-It also enables a high degree of customization and automation, making it easier to adapt to your workflow.
-
-To understand the potential of Pyprland, you can check the [plugins](./Plugins) page.
+## Version 2.4.7 archive
