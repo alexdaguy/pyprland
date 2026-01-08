@@ -15,13 +15,17 @@ class Extension(Plugin):  # pylint: disable=missing-class-docstring
         self.workspace_list = list(range(1, self.config.get("max_workspaces", 10) + 1))
 
     async def event_focusedmon(self, screenid_name: str) -> None:
-        """Reacts to monitor changes."""
+        """Reacts to monitor changes.
+
+        Args:
+            screenid_name: The screen ID and name
+        """
         monitor_id, workspace_name = screenid_name.split(",")
         # move every free workspace to the currently focused desktop
         busy_workspaces = {
-            mon["activeWorkspace"]["name"] for mon in cast(list[dict], await self.hyprctl_json("monitors")) if mon["name"] != monitor_id
+            mon["activeWorkspace"]["name"] for mon in cast("list[dict]", await self.hyprctl_json("monitors")) if mon["name"] != monitor_id
         }
-        workspaces = [w["name"] for w in cast(list[dict], await self.hyprctl_json("workspaces")) if w["id"] > 0]
+        workspaces = [w["name"] for w in cast("list[dict]", await self.hyprctl_json("workspaces")) if w["id"] > 0]
 
         batch: list[str] = []
         for n in workspaces:
@@ -31,7 +35,11 @@ class Extension(Plugin):  # pylint: disable=missing-class-docstring
         await self.hyprctl(batch)
 
     async def run_change_workspace(self, direction: str) -> None:
-        """<+1/-1> Switch workspaces of current monitor, avoiding displayed workspaces."""
+        """<direction> Switch workspaces of current monitor, avoiding displayed workspaces.
+
+        Args:
+            direction: The direction to switch
+        """
         increment = int(direction)
         # get focused screen info
         monitors = await self.hyprctl_json("monitors")

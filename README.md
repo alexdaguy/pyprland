@@ -1,7 +1,7 @@
 ![rect](https://github.com/hyprland-community/pyprland/assets/238622/3fab93b6-6445-4e7b-b757-035095b5c8e8)
 
 [![Hyprland](https://img.shields.io/badge/Made%20for-Hyprland-blue)](https://github.com/hyprwm/Hyprland)
-[![Discord](https://img.shields.io/discord/1055990214411169892?label=discord)](https://discord.com/channels/1055990214411169892/1230972154330218526)
+[![Discord](https://img.shields.io/discord/1055990214411169892?label=discord)](https://discord.com/channels/1458202721294356522/1458202722892386519)
 
 [Documentation](https://hyprland-community.github.io/pyprland) • [Discussions](https://github.com/hyprland-community/pyprland/discussions) • [Changes History](https://github.com/hyprland-community/pyprland/releases) • [Share Your Setup](https://github.com/hyprland-community/pyprland/discussions/46)
 
@@ -22,6 +22,13 @@ Contributions, suggestions, bug reports and comments are welcome.
 - Explore our variety of [plugins](https://hyprland-community.github.io/pyprland/Plugins.html)
   to tailor your Hyprland setup to your liking.
 - New users, check the [getting started](https://hyprland-community.github.io/pyprland/Getting-started.html) guide.
+
+You may also want to browse or install [my dotfiles](https://github.com/fdev31/dotfiles) for some working examples.
+
+# Recent changes
+
+- Almost rewrite of the monitors plugin - hopefully good this time
+- Wallpapers plugin can add rounded corners to each screen and manage a background-derived color scheme (matugen / pywal alike)
 
 <details>
 <summary>
@@ -66,6 +73,7 @@ Dependencies
 - **Hyprland** >= 0.37
 - **Python** >= 3.11
     - **aiofiles** (optional but recommended)
+    - **pillow** (optional, required for rounded borders in `wallpapers`)
 </details>
 
 <details>
@@ -74,6 +82,11 @@ Latest major changes
 </summary>
 
 Check the [Releases change log](https://github.com/hyprland-community/pyprland/releases) for more information
+
+### 2.5
+
+- wallpapers plugin refactored, supports rounded corners and pause
+- fcitx5 switcher plugin (appeared in late 2.4)
 
 ### 2.4
 

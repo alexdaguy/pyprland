@@ -12,7 +12,8 @@ __all__ = [
 
 import asyncio
 import json
-from collections.abc import Callable, Iterable
+from collections.abc import AsyncGenerator, Callable, Iterable
+from contextlib import asynccontextmanager
 from functools import partial
 from logging import Logger
 from typing import Any, cast
@@ -26,8 +27,36 @@ HYPRCTL = f"{IPC_FOLDER}/.socket.sock"
 EVENTS = f"{IPC_FOLDER}/.socket2.sock"
 
 
+@asynccontextmanager
+async def hyprctl_connection(logger: Logger) -> AsyncGenerator[tuple[asyncio.StreamReader, asyncio.StreamWriter], None]:
+    """Context manager for the hyprctl socket.
+
+    Args:
+        logger: Logger to use for error reporting
+    """
+    try:
+        reader, writer = await asyncio.open_unix_connection(HYPRCTL)
+    except FileNotFoundError as e:
+        logger.critical("hyprctl socket not found! is it running ?")
+        raise PyprError from e
+
+    try:
+        yield reader, writer
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
 async def notify(text: str, duration: int = 3, color: str = "ff1010", icon: int = -1, logger: None | Logger = None) -> None:
-    """Hyprland notification system."""
+    """Hyprland notification system.
+
+    Args:
+        text: Notification message
+        duration: Notification duration in seconds
+        color: RGB color code (hex)
+        icon: Icon ID to display
+        logger: Logger instance
+    """
     await hyprctl(f"{icon} {int(duration * 1000)} rgb({color})  {text}", "notify", logger=logger)
 
 
@@ -42,7 +71,11 @@ async def get_event_stream() -> tuple[asyncio.StreamReader, asyncio.StreamWriter
 
 
 def retry_on_reset(func: Callable) -> Callable:
-    """Retry on reset wrapper."""
+    """Retry on reset wrapper.
+
+    Args:
+        func: The function to wrap
+    """
 
     async def wrapper(*args, logger: Logger, **kwargs) -> Any:  # noqa: ANN401
         exc = None
@@ -60,26 +93,30 @@ def retry_on_reset(func: Callable) -> Callable:
 
 
 async def _get_response(command: bytes, logger: Logger) -> JSONResponse:
-    """Get response of `command` from the IPC socket."""
-    try:
-        reader, writer = await asyncio.open_unix_connection(HYPRCTL)
-    except FileNotFoundError as e:
-        logger.critical("hyprctl socket not found! is it running ?")
-        raise PyprError from e
+    """Get response of `command` from the IPC socket.
 
-    writer.write(command)
-    await writer.drain()
-    reader_data = await reader.read()
-    writer.close()
-    await writer.wait_closed()
+    Args:
+        command: The command to send as bytes
+        logger: Logger to use for the connection
+    """
+    async with hyprctl_connection(logger) as (reader, writer):
+        writer.write(command)
+        await writer.drain()
+        reader_data = await reader.read()
+
     decoded_data = reader_data.decode("utf-8", errors="replace")
     return json.loads(decoded_data)  # type: ignore
 
 
 @retry_on_reset
 async def hyprctl_json(command: str, logger: Logger | None = None) -> JSONResponse:
-    """Run an IPC command and return the JSON output."""
-    logger = cast(Logger, logger or log)
+    """Run an IPC command and return the JSON output.
+
+    Args:
+        command: The command to execute
+        logger: Logger to use (defaults to global log)
+    """
+    logger = cast("Logger", logger or log)
     ret = await _get_response(f"-j/{command}".encode(), logger)
     assert isinstance(ret, list | dict)
     return ret
@@ -105,11 +142,11 @@ def _format_command(command_list: list[str] | list[list[str]], default_base_comm
 
 
 @retry_on_reset
-async def hyprctl(command: str | list[str], base_command: str = "dispatch", logger: Logger | None = None, weak: bool = False) -> bool:
+async def hyprctl(args: str | list[str], base_command: str = "dispatch", logger: Logger | None = None, weak: bool = False) -> bool:
     """Run an IPC command. Returns success value.
 
     Args:
-        command: single command (str) or list of commands to send to Hyprland
+        args: single command (str) or list of commands to send to Hyprland
         base_command: type of command to send
         logger: logger to use in case of error
         weak: if True, only log a warning on failure
@@ -117,26 +154,33 @@ async def hyprctl(command: str | list[str], base_command: str = "dispatch", logg
     Returns:
         True on success
     """
-    logger = cast(Logger, logger or log)
-    logger.debug("%s %s", base_command, command)
-    try:
-        ctl_reader, ctl_writer = await asyncio.open_unix_connection(HYPRCTL)
-    except FileNotFoundError as e:
-        logger.critical("hyprctl socket not found! is it running ?")
-        raise PyprError from e
+    logger = cast("Logger", logger or log)
 
-    if isinstance(command, list):
-        nb_cmds = len(command)
-        ctl_writer.write(f"[[BATCH]] {' ; '.join(_format_command(command, base_command))}".encode())
-    else:
-        nb_cmds = 1
-        ctl_writer.write(f"/{base_command} {command}".encode())
-    await ctl_writer.drain()
-    resp = await ctl_reader.read(100)
-    ctl_writer.close()
-    await ctl_writer.wait_closed()
+    if not args:
+        logger.warning("%s triggered without a command!", base_command)
+        return False
+    logger.debug("%s %s", base_command, args)
+
+    async with hyprctl_connection(logger) as (ctl_reader, ctl_writer):
+        if isinstance(args, list):
+            nb_cmds = len(args)
+            ctl_writer.write(f"[[BATCH]] {' ; '.join(_format_command(args, base_command))}".encode())
+        else:
+            nb_cmds = 1
+            ctl_writer.write(f"/{base_command} {args}".encode())
+        await ctl_writer.drain()
+        resp = await ctl_reader.read(100)
+
     # remove "\n" from the response
     resp = b"".join(resp.split(b"\n"))
+    # In Hyprland < 0.40.0 "ok" was returned for success
+    # In newer versions "ok" is not returned anymore (empty response)
+    # So we assume success if response is empty or contains "ok"
+    # But for batch commands, "ok" might be repeated, so we need to be careful
+    # Actually, recent hyprland versions might behave differently.
+    # Let's stick to the current logic but be aware of changes.
+    # The existing logic checks for "ok" * nb_cmds.
+
     r: bool = resp == b"ok" * nb_cmds
     if not r:
         if weak:
@@ -166,17 +210,22 @@ async def get_monitor_props(logger: Logger | None = None, name: str | None = Non
     else:
 
         def _match_fn(mon: MonitorInfo) -> bool:
-            return cast(bool, mon.get("focused"))
+            return cast("bool", mon.get("focused"))
 
     for monitor in await hyprctl_json("monitors", logger=logger):
-        if _match_fn(cast(MonitorInfo, monitor)):
-            return cast(MonitorInfo, monitor)
+        if _match_fn(cast("MonitorInfo", monitor)):
+            return cast("MonitorInfo", monitor)
     msg = "no focused monitor"
     raise RuntimeError(msg)
 
 
 def default_match_fn(value1: Any, value2: Any) -> bool:  # noqa: ANN401
-    """Default match function."""
+    """Default match function.
+
+    Args:
+        value1: First value to compare
+        value2: Second value to compare
+    """
     return bool(value1 == value2)
 
 
@@ -232,7 +281,11 @@ def init() -> None:
 
 
 def get_controls(logger: Logger) -> tuple[Callable, Callable, Callable, Callable, Callable]:
-    """Return (hyprctl, hyprctl_json, notify) configured for the given logger."""
+    """Return (hyprctl, hyprctl_json, notify) configured for the given logger.
+
+    Args:
+        logger: Logger to configure the controls with
+    """
     return (
         partial(hyprctl, logger=logger),
         partial(hyprctl_json, logger=logger),

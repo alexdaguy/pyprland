@@ -4,9 +4,13 @@ import asyncio
 import subprocess
 from collections.abc import Iterable
 from logging import Logger
+from typing import TYPE_CHECKING
 
 from ..common import apply_variables, get_logger
 from ..types import PyprError
+
+if TYPE_CHECKING:
+    from ..common import Configuration
 
 __all__ = ["MenuEngine", "MenuMixin"]
 
@@ -36,7 +40,7 @@ class MenuEngine:
     def is_available(cls) -> bool:
         """Check engine availability."""
         try:
-            subprocess.call([cls.proc_name, *cls.proc_detect_parameters])
+            subprocess.call([cls.proc_name, *cls.proc_detect_parameters], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except FileNotFoundError:
             return False
         return True
@@ -136,7 +140,12 @@ every_menu_engine = [FuzzelMenu, TofiMenu, RofiMenu, WofiMenu, BemenuMenu, Dmenu
 
 
 async def init(force_engine: str | None = None, extra_parameters: str = "") -> MenuEngine:
-    """Initialize the module."""
+    """Initialize the module.
+
+    Args:
+        force_engine: Name of the engine to force use of
+        extra_parameters: Extra parameters to pass to the engine
+    """
     try:
         engines = [next(e for e in every_menu_engine if e.proc_name == force_engine)] if force_engine else every_menu_engine
     except StopIteration:
@@ -167,9 +176,10 @@ class MenuMixin:
     _menu_configured = False
     menu: MenuEngine
     """ provided `MenuEngine` """
-    config: dict
+    config: "Configuration"
     " used by the mixin but provided by `pyprland.plugins.interface.Plugin` "
     log: Logger
+
     " used by the mixin but provided by `pyprland.plugins.interface.Plugin` "
 
     async def ensure_menu_configured(self) -> None:

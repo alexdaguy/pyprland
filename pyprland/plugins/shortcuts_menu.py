@@ -4,17 +4,21 @@ import asyncio
 from typing import cast
 
 from ..adapters.menus import MenuMixin
-from ..common import CastBoolMixin, apply_filter, apply_variables, state
+from ..common import apply_filter, apply_variables
 from .interface import Plugin
 
 
-class Extension(CastBoolMixin, MenuMixin, Plugin):
+class Extension(MenuMixin, Plugin):
     """Shows a menu with shortcuts."""
 
     # Commands
 
     async def run_menu(self, name: str = "") -> None:
-        """[name] Shows the menu, if "name" is provided, will only show this sub-menu."""
+        """[name] Shows the menu, if "name" is provided, will only show this sub-menu.
+
+        Args:
+            name: The menu name
+        """
         await self.ensure_menu_configured()
         options = self.config["entries"]
         if name:
@@ -35,7 +39,7 @@ class Extension(CastBoolMixin, MenuMixin, Plugin):
             selection = name
             if isinstance(options, str):
                 self.log.info("running %s", options)
-                await self._run_command(options.strip(), state.variables)
+                await self._run_command(options.strip(), self.state.variables)
                 break
             if isinstance(options, list):
                 self.log.info("interpreting %s", options)
@@ -43,7 +47,7 @@ class Extension(CastBoolMixin, MenuMixin, Plugin):
                 break
             try:
                 formatted_options = {_format_title(k, v): v for k, v in options.items()}
-                if self.cast_bool(self.config.get("skip_single"), True) and len(formatted_options) == 1:
+                if self.config.get_bool("skip_single", True) and len(formatted_options) == 1:
                     selection = next(iter(formatted_options.keys()))
                 else:
                     selection = await self.menu.run(formatted_options, selection)
@@ -55,9 +59,13 @@ class Extension(CastBoolMixin, MenuMixin, Plugin):
     # Utils
 
     async def _handle_chain(self, options: list[str | dict]) -> None:
-        """Handle a chain of special objects + final command string."""
-        variables: dict[str, str] = state.variables.copy()
-        autovalidate = self.cast_bool(self.config.get("skip_single"), True)
+        """Handle a chain of special objects + final command string.
+
+        Args:
+            options: The chain of options
+        """
+        variables: dict[str, str] = self.state.variables.copy()
+        autovalidate = self.config.get_bool("skip_single", True)
         for option in options:
             if isinstance(option, str):
                 await self._run_command(option, variables)
@@ -80,7 +88,7 @@ class Extension(CastBoolMixin, MenuMixin, Plugin):
                     variables[var_name] = choices[0]
                 else:
                     selection = await self.menu.run(choices, var_name)
-                    variables[var_name] = apply_filter(selection, cast(str, option.get("filter", "")))
+                    variables[var_name] = apply_filter(selection, cast("str", option.get("filter", "")))
                     self.log.debug("set %s = %s", var_name, variables[var_name])
 
     async def _run_command(self, command: str, variables: dict[str, str]) -> None:

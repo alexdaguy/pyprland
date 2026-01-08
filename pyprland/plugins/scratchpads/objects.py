@@ -5,11 +5,12 @@ __all__ = ["Scratch"]
 import asyncio
 import logging
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from ...aioops import aiexists, aiopen
-from ...common import CastBoolMixin, state
+from ...common import SharedState
 from ...types import ClientInfo, MonitorInfo, VersionInfo
 from .helpers import DynMonitorConfig, get_match_fn, mk_scratch_name
 
@@ -21,8 +22,70 @@ if TYPE_CHECKING:
     class ClientPropGetter(Protocol):
         """type for the get_client_props function."""
 
-        async def __call__(self, match_fn: Callable | None = None, clients: list[ClientInfo] | None = None, **kw) -> ClientInfo | None:
+        async def __call__(
+            self,
+            match_fn: Callable = ...,
+            clients: list[ClientInfo] | None = None,
+            **kw: Any,  # noqa: ANN401
+        ) -> ClientInfo | None:
             pass
+
+
+class WindowRuleSet:
+    """Windowrule set builder."""
+
+    def __init__(self, state: SharedState) -> None:
+        self.state = state
+        self._params: list[tuple[str, str]] = []
+        self._class = ""
+        self._name = "PyprScratchR"
+
+    def set_class(self, value: str) -> None:
+        """Set the windowrule matching class.
+
+        Args:
+            value: The class name
+        """
+        self._class = value
+
+    def set_name(self, value: str) -> None:
+        """Set the windowrule name.
+
+        Args:
+            value: The name
+        """
+        self._name = value
+
+    def set(self, param: str, value: str) -> None:
+        """Set a windowrule property.
+
+        Args:
+            param: The property name
+            value: The property value
+        """
+        self._params.append((param, value))
+
+    def _get_content(self) -> Iterable[str]:
+        """Get the windowrule content."""
+        if self.state.hyprland_version > VersionInfo(0, 47, 2):
+            if self.state.hyprland_version < VersionInfo(0, 53, 0):
+                for p in self._params:
+                    yield f"windowrule {p[0]} {p[1]}, class: {self._class}"
+            elif self._name:
+                yield f"windowrule[{self._name}]:enable true"
+                yield f"windowrule[{self._name}]:match:class {self._class}"
+                for p in self._params:
+                    yield f"windowrule[{self._name}]:{p[0]} {p[1]}"
+            else:
+                for p in self._params:
+                    yield f"windowrule {p[0]} {p[1]}, match:class {self._class}"
+        else:
+            for p in self._params:
+                yield f"windowrule {p[0]} {p[1]}, ^({self._class})$"
+
+    def get_content(self) -> list[str]:
+        """Get the windowrule content."""
+        return list(self._get_content())
 
 
 @dataclass
@@ -38,10 +101,9 @@ class MetaInfo:
     extra_positions: dict[str, tuple[int, int]] = field(default_factory=dict)
 
 
-class Scratch(CastBoolMixin):  # {{{
+class Scratch:  # {{{
     """A scratchpad state including configuration & client state."""
 
-    log = logging.getLogger("scratch")
     get_client_props: "ClientPropGetter"
     client_info: ClientInfo
     visible = False
@@ -49,9 +111,12 @@ class Scratch(CastBoolMixin):  # {{{
     monitor = ""
     pid = -1
     excluded_scratches: list[str] = []
+    state: SharedState
 
-    def __init__(self, uid: str, opts: dict[str, Any]) -> None:
+    def __init__(self, uid: str, opts: dict[str, Any], state: SharedState, log: logging.Logger) -> None:
+        self.log = log
         self.uid = uid
+        self.state = state
         self.set_config(opts)
         self.client_info: ClientInfo = {}  # type: ignore
         self.meta = MetaInfo()
@@ -61,12 +126,21 @@ class Scratch(CastBoolMixin):  # {{{
     def forced_monitor(self) -> str | None:
         """Returns forced monitor if available, else None."""
         forced_monitor = self.conf.get("force_monitor")
-        if forced_monitor in state.monitors:
+        if forced_monitor in self.state.monitors:
             return cast("str", forced_monitor)
         return None
 
+    @property
+    def animation_type(self) -> str:
+        """Returns the configured animation (forced lowercase)."""
+        return self.conf.get_str("animation", "").lower()
+
     def _make_initial_config(self, config: dict) -> dict:
-        """Return configuration for the scratchpad."""
+        """Return configuration for the scratchpad.
+
+        Args:
+            config: The full configuration dictionary
+        """
         opts = {}
         scratch_config = config[self.uid]
         if "use" in scratch_config:
@@ -84,14 +158,18 @@ class Scratch(CastBoolMixin):  # {{{
         return opts
 
     def set_config(self, full_config: dict[str, Any]) -> None:
-        """Apply constraints to the configuration."""
+        """Apply constraints to the configuration.
+
+        Args:
+            full_config: The full configuration dictionary
+        """
         opts = self._make_initial_config(full_config)
 
         # apply the config
-        self.conf = DynMonitorConfig(opts, opts.get("monitor", {}))
+        self.conf = DynMonitorConfig(opts, opts.get("monitor", {}), self.state, self.log)
 
         # apply constraints
-        if self.cast_bool(opts.get("preserve_aspect")):
+        if self.conf.get_bool("preserve_aspect"):
             opts["lazy"] = True
         if not self.have_command:
             opts["match_by"] = "class"
@@ -101,11 +179,15 @@ class Scratch(CastBoolMixin):  # {{{
                 opts["match_by"] = "class"
         if opts.get("close_on_hide", False):
             opts["lazy"] = True
-        if state.hyprland_version < VersionInfo(0, 39, 0):
+        if self.state.hyprland_version < VersionInfo(0, 39, 0):
             opts["allow_special_workspace"] = False
 
     def have_address(self, addr: str) -> bool:
-        """Check if the address is the same as the client."""
+        """Check if the address is the same as the client.
+
+        Args:
+            addr: The address to check
+        """
         return addr == self.full_address or addr in self.extra_addr
 
     @property
@@ -114,7 +196,11 @@ class Scratch(CastBoolMixin):  # {{{
         return bool(self.conf.get("command"))
 
     async def initialize(self, ex: "_scratchpads_extension_m.Extension") -> None:
-        """Initialize the scratchpad."""
+        """Initialize the scratchpad.
+
+        Args:
+            ex: The scratchpad extension instance
+        """
         if self.meta.initialized:
             return
         if self.have_command:
@@ -132,7 +218,7 @@ class Scratch(CastBoolMixin):  # {{{
         """Is the process running ?."""
         if not self.have_command:
             return True
-        if self.cast_bool(self.conf.get("process_tracking"), True):
+        if self.conf.get_bool("process_tracking", True):
             path = f"/proc/{self.pid}"
             if await aiexists(path):
                 async with aiopen(os.path.join(path, "status"), mode="r", encoding="utf-8") as f:
@@ -148,7 +234,11 @@ class Scratch(CastBoolMixin):  # {{{
         return False
 
     async def fetch_matching_client(self, clients: list[ClientInfo] | None = None) -> ClientInfo | None:
-        """Fetch the first matching client properties."""
+        """Fetch the first matching client properties.
+
+        Args:
+            clients: The list of clients
+        """
         match_by, match_val = self.get_match_props()
         return await self.get_client_props(
             match_fn=get_match_fn(match_by, match_val),
@@ -158,11 +248,17 @@ class Scratch(CastBoolMixin):  # {{{
 
     def get_match_props(self) -> tuple[str, str | float]:
         """Return the match properties for the scratchpad."""
-        match_by = self.conf.get("match_by", "pid")
-        return match_by, self.pid if match_by == "pid" else self.conf[match_by]
+        match_by = cast("str", self.conf.get("match_by", "pid"))
+        if match_by == "pid":
+            return match_by, self.pid
+        return match_by, cast("str | float", self.conf[match_by])
 
     def reset(self, pid: int) -> None:
-        """Clear the object."""
+        """Clear the object.
+
+        Args:
+            pid: The process ID
+        """
         self.pid = pid
         self.visible = False
         self.client_info = {}  # type: ignore
@@ -183,7 +279,12 @@ class Scratch(CastBoolMixin):  # {{{
         client_info: ClientInfo | None = None,
         clients: list[ClientInfo] | None = None,
     ) -> None:
-        """Update the internal client info property, if not provided, refresh based on the current address."""
+        """Update the internal client info property, if not provided, refresh based on the current address.
+
+        Args:
+            client_info: The client info
+            clients: The list of clients
+        """
         if client_info is None:
             if self.have_command:
                 client_info = await self.get_client_props(addr=self.full_address, clients=clients)
@@ -198,7 +299,11 @@ class Scratch(CastBoolMixin):  # {{{
         self.client_info.update(client_info)
 
     def event_workspace(self, name: str) -> None:
-        """Check if the workspace changed."""
+        """Check if the workspace changed.
+
+        Args:
+            name: The workspace name
+        """
         if self.conf.get("pinned", True):
             self.meta.space_identifier = name, self.meta.space_identifier[1]
 

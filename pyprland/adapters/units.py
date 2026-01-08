@@ -22,6 +22,11 @@ def convert_monitor_dimension(size: int | str, ref_value: int, monitor: MonitorI
     if size is an integer, assumed pixels & return it
     if size is a string, expects a "%" or "px" suffix
     else throws an error
+
+    Args:
+        size: The size to convert (int or string with unit)
+        ref_value: Reference value for percentage calculations
+        monitor: Monitor information
     """
 
     scaled_ref_value = ref_value / monitor["scale"]
@@ -49,6 +54,10 @@ def convert_coords(coords: str, monitor: MonitorInfo) -> list[int]:
 
     Example:
     "10% 20%", monitor 800x600 => 80, 120
+
+    Args:
+        coords: Coordinates string "X Y"
+        monitor: Monitor information
     """
     return [
         convert_monitor_dimension(name, monitor[ref], monitor)  # type: ignore

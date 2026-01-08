@@ -1,5 +1,6 @@
 """Shared utilities: logging."""
 
+import contextlib
 import fcntl
 import logging
 import os
@@ -10,6 +11,7 @@ import struct
 import subprocess
 import sys
 import termios
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -21,12 +23,9 @@ __all__ = [
     "get_logger",
     "merge",
     "run_interactive_program",
-    "state",
     "init_logger",
     "SharedState",
-    "prepare_for_quotes",
     "apply_filter",
-    "CastBoolMixin",
     "is_rotated",
 ]
 
@@ -42,32 +41,48 @@ MAX_SOCKET_PATH_LEN = 107
 
 try:
     # May throw an OSError because AF_UNIX path is too long: try to work around it only if needed
-    original_ipc_folder = (
+    ORIGINAL_IPC_FOLDER = (
         f"{os.environ['XDG_RUNTIME_DIR']}/hypr/{HYPRLAND_INSTANCE_SIGNATURE}"
-        if os.path.exists(f"{os.environ['XDG_RUNTIME_DIR']}/hypr/{HYPRLAND_INSTANCE_SIGNATURE}")
+        if os.path.exists(f"{os.environ.get('XDG_RUNTIME_DIR', '')}/hypr/{HYPRLAND_INSTANCE_SIGNATURE}")
         else f"/tmp/hypr/{HYPRLAND_INSTANCE_SIGNATURE}"  # noqa: S108
     )
 
-    if len(original_ipc_folder) >= MAX_SOCKET_PATH_LEN - MAX_SOCKET_FILE_LEN:
+    if len(ORIGINAL_IPC_FOLDER) >= MAX_SOCKET_PATH_LEN - MAX_SOCKET_FILE_LEN:
         IPC_FOLDER = f"/tmp/.pypr-{HYPRLAND_INSTANCE_SIGNATURE}"  # noqa: S108
-        # make a link from short path to original path
-        if not os.path.exists(IPC_FOLDER):
-            os.symlink(original_ipc_folder, IPC_FOLDER)
     else:
-        IPC_FOLDER = original_ipc_folder
+        IPC_FOLDER = ORIGINAL_IPC_FOLDER
+
+    def init_ipc_folder() -> None:
+        """Initialize the IPC folder."""
+        if ORIGINAL_IPC_FOLDER != IPC_FOLDER and not os.path.exists(IPC_FOLDER):
+            with contextlib.suppress(OSError):
+                os.symlink(ORIGINAL_IPC_FOLDER, IPC_FOLDER)
 
 except KeyError:
     print("This is a fatal error, assuming we are running documentation generation or testing in a sandbox, hence ignoring it")
     IPC_FOLDER = "/"
 
+    def init_ipc_folder() -> None:
+        """Initialize the IPC folder."""
+
 
 def set_terminal_size(descriptor: int, rows: int, cols: int) -> None:
-    """Set the terminal size."""
+    """Set the terminal size.
+
+    Args:
+        descriptor: File descriptor of the terminal
+        rows: Number of rows
+        cols: Number of columns
+    """
     fcntl.ioctl(descriptor, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
 
 def set_raw_mode(descriptor: int) -> None:
-    """Set a file descriptor in raw mode."""
+    """Set a file descriptor in raw mode.
+
+    Args:
+        descriptor: File descriptor to set to raw mode
+    """
     # Get the current terminal attributes
     attrs = termios.tcgetattr(descriptor)
     # Set the terminal to raw mode
@@ -77,7 +92,11 @@ def set_raw_mode(descriptor: int) -> None:
 
 
 def run_interactive_program(command: str) -> None:
-    """Run an interactive program in a blocking way."""
+    """Run an interactive program in a blocking way.
+
+    Args:
+        command: The command to run
+    """
     # Create a pseudo-terminal
     master, slave = pty.openpty()
 
@@ -129,7 +148,7 @@ def merge(merged: dict[str, Any], obj2: dict[str, Any]) -> dict[str, Any]:
         obj2 (dict): Dictionary to merge from
 
     Returns:
-        `merged` dictionary with the merged content
+         dictionary with the merged content
 
     Eg:
         merge({"a": {"b": 1}}, {"a": {"c": 2}}) == {"a": {"b": 1, "c": 2}}
@@ -155,7 +174,12 @@ class LogObjects:
 
 
 def init_logger(filename: str | None = None, force_debug: bool = False) -> None:
-    """Initialize the logging system."""
+    """Initialize the logging system.
+
+    Args:
+        filename: Optional filename to log to
+        force_debug: If True, force debug level
+    """
     global DEBUG
     if force_debug:
         DEBUG = True
@@ -193,6 +217,9 @@ def get_logger(name: str = "pypr", level: int | None = None) -> logging.Logger:
     Args:
         name (str): logger's name
         level (int): logger's level (auto if not set)
+
+    Returns:
+        The logger instance
     """
     logger = logging.getLogger(name)
     if level is None:
@@ -218,26 +245,15 @@ class SharedState:
     hyprland_version: VersionInfo = field(default_factory=VersionInfo)
 
 
-state: SharedState = SharedState()
-"""
-Exposes most-commonly accessed attributes to avoid specific IPC requests
-- `active_monitor` monitor's name
-- `active_workspace` workspace's name
-- `active_window` window's address
-"""
-
-
-def prepare_for_quotes(text: str) -> str:
-    """Escapes double quotes in text."""
-    return text.replace('"', '\\"')
-
-
 def apply_variables(template: str, variables: dict[str, str]) -> str:
     """Replace [var_name] with content from supplied variables.
 
     Args:
         template: the string template
         variables: a dict containing the variables to replace
+
+    Returns:
+        The template with variables replaced
     """
     pattern = r"\[([^\[\]]+)\]"
 
@@ -252,29 +268,134 @@ def apply_filter(text: str, filt_cmd: str) -> str:
     """Apply filters to text.
 
     Currently supports only "s" command fom vim/ed
+
+    Args:
+        text: The text to filter
+        filt_cmd: The filter command (e.g. "s/foo/bar/g")
+
+    Returns:
+        The filtered text
     """
     if not filt_cmd:
         return text
     if filt_cmd[0] == "s":  # vi-like substitute
-        (_, base, replacement, opts) = filt_cmd.split(filt_cmd[1])
-        return re.sub(base, replacement, text, count=0 if "g" in opts else 1)
+        try:
+            sep = filt_cmd[1]
+            parts = filt_cmd.split(sep)
+            if len(parts) < 3:
+                return text
+            (_, base, replacement, opts) = parts[:4]
+            return re.sub(base, replacement, text, count=0 if "g" in opts else 1)
+        except (IndexError, ValueError):
+            return text
     return text
 
 
-class CastBoolMixin:
-    """Adds `cast_bool` method."""
+class Configuration(dict):
+    """Configuration wrapper providing typed access and section filtering."""
 
-    log: logging.Logger
+    def __init__(self, *args, logger: logging.Logger | None = None, **kwargs):
+        """Initialize the configuration object.
 
-    def cast_bool(self, value: str | bool | None, default_value: bool = False) -> bool:
-        """Recovers wrong typing on boolean values."""
+        Args:
+            *args: Arguments for dict
+            logger: Optional logger to use
+            **kwargs: Keyword arguments for dict
+        """
+        super().__init__(*args, **kwargs)
+        self.log = logger or get_logger("config")
+
+    def _get_converted(self, name: str, default: Any, converter: type) -> Any:  # noqa: ANN401
+        """Get a value and convert it safely, using a shared helper.
+
+        Args:
+            name: The key name
+            default: Default value if conversion fails or key is missing
+            converter: The type/function to use for conversion
+        """
+        value = self.get(name)
+        if value is None:
+            return default
+        try:
+            return converter(value)
+        except (ValueError, TypeError):
+            self.log.warning("Invalid %s value for %s: %s", converter.__name__, name, value)
+            return default
+
+    def get_bool(self, name: str, default: bool = False) -> bool:
+        """Get a boolean value, handling loose typing.
+
+        Args:
+            name: The key name
+            default: Default value if key is missing
+
+        Returns:
+            The boolean value
+        """
+        value = self.get(name)
         if isinstance(value, str):
-            lv = value.lower().strip()
-            r = lv not in {"false", "no", "off"}
-            self.log.warning("Invalid value for boolean option: %s, considering it %s", value, r)
-        return default_value if value is None else cast(bool, value)
+            return value.lower().strip() in {"true", "yes", "on", "1"}
+        if value is None:
+            return default
+        return bool(value)
+
+    def get_int(self, name: str, default: int = 0) -> int:
+        """Get an integer value.
+
+        Args:
+            name: The key name
+            default: Default value if key is missing
+
+        Returns:
+            The integer value
+        """
+        return cast("int", self._get_converted(name, default, int))
+
+    def get_float(self, name: str, default: float = 0.0) -> float:
+        """Get a float value.
+
+        Args:
+            name: The key name
+            default: Default value if key is missing
+
+        Returns:
+            The float value
+        """
+        return cast("float", self._get_converted(name, default, float))
+
+    def get_str(self, name: str, default: str = "") -> str:
+        """Get a string value.
+
+        Args:
+            name: The key name
+            default: Default value if key is missing
+
+        Returns:
+            The string value
+        """
+        value = self.get(name)
+        if value is None:
+            return default
+        return str(value)
+
+    def iter_subsections(self) -> Iterator[tuple[str, dict[str, Any]]]:
+        """Yield only keys that have dictionary values (e.g., defined scratchpads).
+
+        Returns:
+            Iterator of (key, value) pairs where value is a dictionary
+        """
+        for k, v in self.items():
+            if isinstance(v, dict):
+                yield k, v
 
 
 def is_rotated(monitor: MonitorInfo) -> bool:
-    """Return True if the monitor is rotated."""
+    """Return True if the monitor is rotated.
+
+    Args:
+        monitor: The monitor info dictionary
+
+    Returns:
+        True if the monitor is rotated (transform is 1, 3, 5, or 7)
+    """
     return monitor["transform"] in {1, 3, 5, 7}

@@ -1,6 +1,6 @@
 [project]
 name = "pyprland"
-version = "2.5.0"
+version = "2.6.1"
 description = "Hyperland plugin system - batteries included"
 authors = [
     { name = "Fabien Devaux", email = "fdev31 <fdev31@gmail.com>" },
@@ -11,32 +11,33 @@ homepage = "https://github.com/hyprland-community/pyprland/"
 packages = [
     { include = "pyprland" },
 ]
-dependencies = [
-    "aiofiles >=23.2.1",
-]
 requires-python = ">=3.11"
+dependencies = [
+    "aiofiles >= 23.2.1",
+    "pillow[rounded] >= 10.0.0",
+]
 
 [project.scripts]
 pypr = "pyprland.command:main"
 
-[tool.poetry.group.dev.dependencies]
-black = "^24.1.1"
-coverage = "^7.4.1"
-flake8 = "^7.0.0"
-mypy = "^1.8.0"
-pdoc = "^14.4.0"
-pydantic = "^2.6.1"
-pylint = "^3.0.3"
-pytest = "^7.4.3"
-pytest-asyncio = "^0.23.2"
-pytest-mock = "^3.12.0"
-ruff = "^0.4.2"
-vulture = "^2.11"
-
-[tool.poetry.group.test.dependencies]
-pytest = "^7.4.3"
-pytest-asyncio = "^0.23.2"
-pytest-mock = "^3.12.0"
+[dependency-groups]
+dev = [
+    "pytest >=7.4.3",
+    "pytest-asyncio >=0.23.2",
+    "pytest-mock >=3.12.0",
+    "vulture >=2.11",
+    "coverage >=7.4.1",
+    "mypy >=1.8.0",
+    "pdoc >=14.4.0",
+]
+lint = [
+    "black >=24.1.1",
+    "flake8 >=7.0.0",
+    "pydantic >=2.6.1",
+    "pylint >=3.0.3",
+    "ruff >=0.4.2",
+    "types-aiofiles >=25.1.0.20251011",
+]
 
 [tool.ruff]
 line-length = 140
@@ -58,6 +59,8 @@ fixable = [
     "ALL",
 ]
 ignore = [
+    "ANN101",
+    "ANN102",
     "ANN002",
     "ANN003",
     "ANN204",
@@ -65,6 +68,7 @@ ignore = [
     "D107",
     "E203",
     "ISC001",
+    "PLR2004",
     "PLW0603",
     "PTH118",
     "RET503",

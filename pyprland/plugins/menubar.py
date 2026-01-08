@@ -3,9 +3,11 @@
 import asyncio
 import contextlib
 import os
+from collections.abc import Callable
 from time import time
+from typing import Any, cast
 
-from ..common import apply_variables, state
+from ..common import apply_variables
 from .interface import Plugin
 
 COOLDOWN_TIME = 60
@@ -13,17 +15,26 @@ IDLE_LOOP_INTERVAL = 10
 
 
 def get_pid_from_layers(layers: dict) -> bool | int:
-    """Get the PID of the bar from the layers."""
+    """Get the PID of the bar from the layers.
+
+    Args:
+        layers: The layers dictionary
+    """
     for screen in layers:
         for layer in layers[screen]["levels"].values():
             for instance in layer:
                 if instance["namespace"].startswith("bar-"):
-                    return instance["pid"] > 0 and instance["pid"]
+                    return instance["pid"] > 0 and cast("int", instance["pid"])
     return False
 
 
-async def is_bar_alive(pid: int, hyprctl_json: dict) -> int | bool:
-    """Check if the bar is running."""
+async def is_bar_alive(pid: int, hyprctl_json: Callable[..., Any]) -> int | bool:
+    """Check if the bar is running.
+
+    Args:
+        pid: The process ID
+        hyprctl_json: The hyprctl JSON function
+    """
     is_running = os.path.exists(f"/proc/{pid}")
     if is_running:
         print("found running", pid)
@@ -65,7 +76,10 @@ class Extension(Plugin):
                         continue
 
                 await self.set_best_monitor()
-                cmd = apply_variables(self.config.get("command", "gBar bar [monitor]"), {"monitor": self.cur_monitor})
+                cmd = apply_variables(
+                    self.config.get("command", "gBar bar [monitor]"),
+                    {"monitor": self.cur_monitor if self.cur_monitor else ""},
+                )
                 start_time = time()
                 self.proc = await asyncio.create_subprocess_shell(cmd)
                 pid = self.proc.pid
@@ -78,22 +92,26 @@ class Extension(Plugin):
                 text = f"Menu Bar crashed, restarting in {delay}s." if delay > 0 else "Menu Bar crashed, restarting immediately."
                 self.log.warning(text)
                 if delay:
-                    await self.notify_warn(text)
+                    await self.notify_info(text)
                 await asyncio.sleep(delay or 0.1)
 
         self.ongoing_task = asyncio.create_task(_run_loop())
 
     async def run_bar(self, args: str) -> None:
-        """Start gBar on the first available monitor."""
-        if args.startswith("re"):
-            self.kill()
+        """<restart|stop> Start (default), restart or stop gBar.
+
+        Args:
+            args: The command arguments
+        """
+        self.kill()
+        if not args.startswith("stop"):
             await self.on_reload()
 
     async def set_best_monitor(self) -> None:
         """Set the best monitor to use in `cur_monitor`."""
         self.cur_monitor = await self.get_best_monitor()
         if not self.cur_monitor:
-            self.cur_monitor = next(iter(state.monitors))
+            self.cur_monitor = next(iter(self.state.monitors))
             await self.notify_info(f"gBar: No preferred monitor found, using {self.cur_monitor}")
 
     async def get_best_monitor(self) -> str:
@@ -107,10 +125,16 @@ class Extension(Plugin):
         return ""
 
     async def event_monitoradded(self, monitor: str) -> None:
-        """Switch bar in case the monitor is preferred."""
+        """Switch bar in case the monitor is preferred.
+
+        Args:
+            monitor: The monitor name
+        """
         if self.cur_monitor:
             preferred = self.config.get("monitors", [])
             cur_idx = preferred.index(self.cur_monitor) if self.cur_monitor else 999
+            if monitor not in preferred:
+                return
             new_idx = preferred.index(monitor)
             if 0 <= new_idx < cur_idx:
                 self.kill()
