@@ -2,11 +2,18 @@
 
 from typing import cast
 
+from ..validation import ConfigField, ConfigItems
 from .interface import Plugin
 
 
-class Extension(Plugin):  # pylint: disable=missing-class-docstring
+class Extension(Plugin):
     """Toggle switching the focused window to a special workspace."""
+
+    environments = ["hyprland"]
+
+    config_schema = ConfigItems(
+        ConfigField("name", str, default="minimized", description="Default special workspace name"),
+    )
 
     async def run_toggle_special(self, special_workspace: str = "minimized") -> None:
         """[name] Toggles switching the focused window to the special workspace "name" (default: minimized).
@@ -14,11 +21,11 @@ class Extension(Plugin):  # pylint: disable=missing-class-docstring
         Args:
             special_workspace: The special workspace name
         """
-        aw = cast("dict", await self.hyprctl_json("activewindow"))
+        aw = cast("dict", await self.backend.execute_json("activewindow"))
         wid = aw["workspace"]["id"]
         assert isinstance(wid, int)
         if wid < 1:  # special workspace
-            await self.hyprctl(
+            await self.backend.execute(
                 [
                     f"togglespecialworkspace {special_workspace}",
                     f"movetoworkspacesilent {self.state.active_workspace},address:{aw['address']}",
@@ -26,4 +33,4 @@ class Extension(Plugin):  # pylint: disable=missing-class-docstring
                 ]
             )
         else:
-            await self.hyprctl(f"movetoworkspacesilent special:{special_workspace},address:{aw['address']}")
+            await self.backend.move_window_to_workspace(aw["address"], f"special:{special_workspace}")

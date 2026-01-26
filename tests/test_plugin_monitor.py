@@ -321,8 +321,12 @@ async def test_events4():
 @pytest.mark.asyncio
 async def test_nothing():
     await tst.pypr("inexistent")
-    assert tst.hyprctl.call_args_list[0][0][1] == "notify"
     assert tst.hyprctl.call_count == 1
+    # Check that notify was called with base_command="notify"
+    assert tst.hyprctl.call_args.kwargs.get("base_command") == "notify"
+    assert "Unknown command" in tst.hyprctl.call_args[0][0]
+
+
 import pytest
 import tomllib
 from pytest_asyncio import fixture

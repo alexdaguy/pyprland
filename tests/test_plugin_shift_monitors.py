@@ -6,16 +6,19 @@ from pyprland.plugins.shift_monitors import Extension
 @pytest.fixture
 def extension():
     ext = Extension("shift_monitors")
-    ext.hyprctl = AsyncMock()
-    ext.hyprctl_json = AsyncMock()
+    ext.backend = AsyncMock()
+    ext.backend.execute = AsyncMock()
+    ext.backend.execute_json = AsyncMock()
     ext.monitors = ["M1", "M2", "M3"]
+    ext.state = Mock()  # Mock the state
+    ext.state.environment = "hyprland"  # Default to hyprland for existing tests
     return ext
 
 
 @pytest.mark.asyncio
 async def test_init(extension):
     extension.monitors = []
-    extension.hyprctl_json.return_value = [{"name": "A"}, {"name": "B"}]
+    extension.backend.get_monitors.return_value = [{"name": "A"}, {"name": "B"}]
 
     await extension.init()
 
@@ -29,9 +32,9 @@ async def test_shift_positive(extension):
 
     await extension.run_shift_monitors("1")
 
-    assert extension.hyprctl.call_count == 2
+    assert extension.backend.execute.call_count == 2
     # Verify order matters
-    extension.hyprctl.assert_has_calls([call("swapactiveworkspaces M3 M2"), call("swapactiveworkspaces M2 M1")])
+    extension.backend.execute.assert_has_calls([call("swapactiveworkspaces M3 M2"), call("swapactiveworkspaces M2 M1")])
 
 
 @pytest.mark.asyncio
@@ -41,8 +44,8 @@ async def test_shift_negative(extension):
 
     await extension.run_shift_monitors("-1")
 
-    assert extension.hyprctl.call_count == 2
-    extension.hyprctl.assert_has_calls([call("swapactiveworkspaces M1 M2"), call("swapactiveworkspaces M2 M3")])
+    assert extension.backend.execute.call_count == 2
+    extension.backend.execute.assert_has_calls([call("swapactiveworkspaces M1 M2"), call("swapactiveworkspaces M2 M3")])
 
 
 @pytest.mark.asyncio

@@ -1,27 +1,95 @@
 """generic fixtures."""
 
+from __future__ import annotations
+
 import asyncio
+import logging
 import os
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 from unittest.mock import AsyncMock, MagicMock, Mock
 
+import pytest
 import tomllib
 from pytest_asyncio import fixture
 
 from .testtools import MockReader, MockWriter
+
+if TYPE_CHECKING:
+    from pyprland.manager import Pyprland
 
 os.environ["HYPRLAND_INSTANCE_SIGNATURE"] = "ABCD"
 
 CONFIG_1 = tomllib.load(open("tests/sample_config.toml", "rb"))
 
 
+@pytest.fixture
+def test_logger():
+    """Provide a silent logger for tests."""
+    logger = logging.getLogger("test")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+    return logger
+
+
+# Error patterns to detect in stderr during tests
+ERROR_PATTERNS = [
+    "failed:",
+    "Error:",
+    "ERROR",
+    "Exception",
+    "Traceback",
+]
+
+# Patterns to ignore (false positives)
+ERROR_IGNORE_PATTERNS = [
+    "notify_error",  # Method name, not an actual error
+    "ConnectionResetError",  # Expected in some cleanup scenarios
+    "BrokenPipeError",  # Expected in some cleanup scenarios
+    "DeprecationWarning",  # Python deprecation warnings
+    "Config error for",  # Validation errors from run_validate command (expected in tests)
+]
+
+
 def pytest_configure():
     """Runs once before all."""
+    os.environ["PYPRLAND_STRICT_ERRORS"] = "1"
     from pyprland.common import init_logger
 
     init_logger("/dev/null", force_debug=True)
+
+
+def _contains_error(text: str) -> str | None:
+    """Check if text contains error patterns, returns the matching line or None."""
+    for line in text.split("\n"):
+        # Skip ignored patterns
+        if any(ignore in line for ignore in ERROR_IGNORE_PATTERNS):
+            continue
+        # Check for error patterns
+        for pattern in ERROR_PATTERNS:
+            if pattern in line:
+                return line.strip()
+    return None
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Check captured stderr for error patterns after each test."""
+    outcome = yield
+    report = outcome.get_result()
+
+    # Only check after the test call phase (not setup/teardown)
+    if call.when == "call" and report.passed:
+        # Check captured output sections
+        for section_name, content in report.sections:
+            if "stderr" in section_name.lower() or "captured" in section_name.lower():
+                error_line = _contains_error(content)
+                if error_line:
+                    report.outcome = "failed"
+                    report.longrepr = f"Error detected in captured output:\n{error_line}"
+                    return
 
 
 # Mocks
@@ -38,15 +106,34 @@ class GlobalMocks:
 
     _pypr_command_reader: Callable = None
 
+    # Test-only instance tracking (replaces Pyprland.instance singleton)
+    pyprland_instance: Pyprland | None = None
+
     def reset(self):
         """Resets not standard mocks."""
         self.json_commands_result.clear()
+        self.pyprland_instance = None
 
     async def pypr(self, cmd):
         """Simulates the pypr command."""
         assert self.pyprctrl
         await self.pyprctrl[0].q.put(b"%s\n" % cmd.encode("utf-8"))
         await self._pypr_command_reader(*self.pyprctrl)
+
+    async def wait_queues(self):
+        """Wait for all plugin queues to be empty.
+
+        This ensures background tasks have finished processing.
+        """
+        if self.pyprland_instance is None:
+            return
+        for _ in range(100):  # max 10 seconds
+            all_empty = all(q.empty() for q in self.pyprland_instance.queues.values())
+            if all_empty:
+                # Give one more tick for any pending task to complete
+                await asyncio.sleep(0.01)
+                return
+            await asyncio.sleep(0.1)
 
     async def send_event(self, cmd):
         """Simulates receiving a Hyprland event."""
@@ -93,7 +180,7 @@ async def sample1_config(monkeypatch):
     yield
 
 
-async def mocked_hyprctl_json(command, logger=None):
+async def mocked_hyprctl_json(self, command, *, log=None, **kwargs):
     if command in mocks.json_commands_result:
         return mocks.json_commands_result[command]
     if command.startswith("monitors"):
@@ -144,18 +231,29 @@ async def server_fixture(monkeypatch, mocker):
     monkeypatch.setattr("asyncio.open_unix_connection", mocked_unix_connection)
     monkeypatch.setattr("asyncio.start_unix_server", mocked_unix_server)
 
-    monkeypatch.setattr("pyprland.ipc.hyprctl_json", mocked_hyprctl_json)
-    monkeypatch.setattr("pyprland.ipc.hyprctl", mocks.hyprctl)
+    from pyprland.adapters.hyprland import HyprlandBackend
+
+    monkeypatch.setattr(HyprlandBackend, "execute_json", mocked_hyprctl_json)
+    monkeypatch.setattr(HyprlandBackend, "execute", mocks.hyprctl)
 
     from pyprland import ipc
-    from pyprland.command import run_daemon
+    from pyprland.manager import Pyprland
+    from pyprland.pypr_daemon import run_daemon
+
+    # Capture the Pyprland instance when it's created
+    original_init = Pyprland.__init__
+
+    def patched_init(self):
+        original_init(self)
+        mocks.pyprland_instance = self
+
+    monkeypatch.setattr(Pyprland, "__init__", patched_init)
 
     ipc.init()
 
     server_task = asyncio.create_task(run_daemon())
-    from pyprland.command import Pyprland
 
-    # spy on Pyprland.log.debug using mocker
+    # spy on Pyprland.run using mocker
     run_spi = mocker.spy(Pyprland, "run")
 
     for _ in range(10):

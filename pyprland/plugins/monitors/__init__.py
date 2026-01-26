@@ -1,28 +1,87 @@
 """The monitors plugin."""
 
 import asyncio
-from collections import defaultdict
-from typing import Any, cast
+from typing import Any
 
-from ...types import MonitorInfo
+from ...adapters.niri import niri_output_to_monitor_info
+from ...aioops import DebouncedTask
+from ...models import MonitorInfo
+from ...validation import ConfigField, ConfigItems
 from ..interface import Plugin
-from .layout import MONITOR_PROPS, compute_xy, get_dims
+from .commands import (
+    build_hyprland_command,
+    build_niri_disable_action,
+    build_niri_position_action,
+    build_niri_scale_action,
+    build_niri_transform_action,
+)
+from .layout import (
+    MONITOR_PROPS,
+    build_graph,
+    compute_positions,
+    find_cycle_path,
+)
+from .resolution import get_monitor_by_pattern, resolve_placement_config
+
+
+def _check_placement_keys(value: dict[str, Any]) -> list[str]:
+    """Validator for placement config keys.
+
+    Args:
+        value: The placement configuration dictionary
+    """
+    errors = []
+    valid_props = MONITOR_PROPS.union({"disables"})
+    valid_keys = {"top", "bottom", "left", "right"}
+    for rules in value.values():
+        for key, val in rules.items():
+            if key in valid_props:
+                continue
+            if not any(key.startswith(vkey.lower()) for vkey in valid_keys):
+                errors.append(f"Invalid placement rule key: {key}")
+            elif not isinstance(val, str) and not all(isinstance(o, str) for o in val):
+                errors.append(f"Invalid placement value: {val}")
+    return errors
 
 
 class Extension(Plugin):
-    """Control monitors layout."""
+    """Allows relative placement and configuration of monitors."""
 
-    _mon_by_pat_cache: dict[str, MonitorInfo] = {}
+    environments = ["hyprland", "niri"]
+
+    config_schema = ConfigItems(
+        ConfigField("startup_relayout", bool, default=True, description="Relayout monitors on startup"),
+        ConfigField("relayout_on_config_change", bool, default=True, description="Relayout when Hyprland config is reloaded"),
+        ConfigField("new_monitor_delay", float, default=1.0, description="Delay in seconds before handling new monitor"),
+        ConfigField("unknown", str, default="", description="Command to run when an unknown monitor is detected"),
+        ConfigField(
+            "placement",
+            dict,
+            required=True,
+            default={},
+            description="Monitor placement rules (pattern -> positioning rules)",
+            validator=_check_placement_keys,
+        ),
+        ConfigField(
+            "hotplug_commands", dict, default={}, description="Commands to run when specific monitors are plugged (pattern -> command)"
+        ),
+        ConfigField("hotplug_command", str, default="", description="Command to run when any monitor is plugged"),
+    )
+
+    _mon_by_pat_cache: dict[str, MonitorInfo]
+    _relayout_debouncer: DebouncedTask
 
     async def on_reload(self) -> None:
         """Reload the plugin."""
+        self._mon_by_pat_cache = {}
+        self._relayout_debouncer = DebouncedTask(ignore_window=3.0)
         self._clear_mon_by_pat_cache()
-        monitors = await self.hyprctl_json("monitors all")
+        monitors = await self.backend.get_monitors(include_disabled=True)
 
         for mon in self.state.monitors:
             await self._hotplug_command(monitors, name=mon)
 
-        if self.config.get_bool("startup_relayout", True):
+        if self.get_config_bool("startup_relayout"):
 
             async def _delayed_relayout() -> None:
                 await self._run_relayout(monitors)
@@ -33,8 +92,12 @@ class Extension(Plugin):
 
     async def event_configreloaded(self, _: str = "") -> None:
         """Relayout screens after settings has been lost."""
-        if not self.config.get("relayout_on_config_change", True):
+        if not self.get_config_bool("relayout_on_config_change"):
             return
+        self._relayout_debouncer.schedule(self._delayed_relayout, delay=1.0)
+
+    async def _delayed_relayout(self) -> None:
+        """Delayed relayout that runs twice with 1s gap."""
         for _i in range(2):
             await asyncio.sleep(1)
             await self._run_relayout()
@@ -45,14 +108,25 @@ class Extension(Plugin):
         Args:
             name: The name of the added monitor
         """
-        await asyncio.sleep(self.config.get("new_monitor_delay", 1.0))
-        monitors = await self.hyprctl_json("monitors all")
+        delay = self.get_config_float("new_monitor_delay")
+        await asyncio.sleep(delay)
+        monitors = await self.backend.get_monitors(include_disabled=True)
         await self._hotplug_command(monitors, name)
 
         if not await self._run_relayout(monitors):
-            default_command = self.config.get("unknown")
+            default_command = self.get_config_str("unknown")
             if default_command:
                 await asyncio.create_subprocess_shell(default_command)
+
+    async def niri_outputschanged(self, _data: dict) -> None:
+        """Handle Niri output changes.
+
+        Args:
+            _data: Event data from Niri (unused)
+        """
+        delay = self.get_config_float("new_monitor_delay")
+        await asyncio.sleep(delay)
+        await self._run_relayout()
 
     async def run_relayout(self) -> bool:
         """Recompute & apply every monitors's layout."""
@@ -64,8 +138,11 @@ class Extension(Plugin):
         Args:
             monitors: Optional list of monitors to use. If not provided, fetches current state.
         """
+        if self.state.environment == "niri":
+            return await self._run_relayout_niri()
+
         if monitors is None:
-            monitors = cast("list[MonitorInfo]", await self.hyprctl_json("monitors all"))
+            monitors = await self.backend.get_monitors(include_disabled=True)
 
         self._clear_mon_by_pat_cache()
 
@@ -79,16 +156,8 @@ class Extension(Plugin):
 
         monitors_by_name = {m["name"]: m for m in monitors}
 
-        monitors_to_disable = set()
-        for cfg in config.values():
-            if "disables" in cfg:
-                monitors_to_disable.update(cfg["disables"])
-
-        for name in monitors_to_disable:
-            if name in monitors_by_name:
-                monitors_by_name[name]["to_disable"] = True
-
-        enabled_monitors_by_name = {k: v for k, v in monitors_by_name.items() if not v.get("to_disable")}
+        # Mark monitors to disable and get enabled monitors
+        enabled_monitors_by_name = self._mark_disabled_monitors(config, monitors_by_name)
 
         # 2. Build dependency graph
         tree, in_degree = self._build_graph(config, enabled_monitors_by_name)
@@ -99,6 +168,59 @@ class Extension(Plugin):
         # 4 & 5. Normalize and Apply
         return await self._apply_layout(positions, monitors_by_name, config)
 
+    async def _run_relayout_niri(self) -> bool:
+        """Niri implementation of relayout."""
+        outputs = await self.backend.execute_json("outputs")
+
+        monitors: list[MonitorInfo] = [niri_output_to_monitor_info(name, data) for name, data in outputs.items()]
+
+        self._clear_mon_by_pat_cache()
+
+        # 1. Resolve configuration
+        config = self._resolve_names(monitors)
+        if not config:
+            self.log.debug("No configuration item is applicable")
+            return False
+
+        monitors_by_name = {m["name"]: m for m in monitors}
+
+        # Mark monitors to disable and get enabled monitors
+        enabled_monitors_by_name = self._mark_disabled_monitors(config, monitors_by_name)
+
+        # 2. Build dependency graph
+        tree, in_degree = self._build_graph(config, enabled_monitors_by_name)
+
+        # 3. Compute Layout
+        positions = self._compute_positions(enabled_monitors_by_name, tree, in_degree, config)
+
+        # 4 & 5. Apply
+        return await self._apply_layout(positions, monitors_by_name, config)
+
+    def _mark_disabled_monitors(
+        self,
+        config: dict[str, Any],
+        monitors_by_name: dict[str, MonitorInfo],
+    ) -> dict[str, MonitorInfo]:
+        """Mark monitors to disable and return enabled monitors.
+
+        Args:
+            config: Configuration dictionary containing optional 'disables' lists
+            monitors_by_name: Mapping of monitor names to info (modified in-place)
+
+        Returns:
+            Dictionary of enabled monitors (excludes those marked to_disable)
+        """
+        monitors_to_disable: set[str] = set()
+        for cfg in config.values():
+            if "disables" in cfg:
+                monitors_to_disable.update(cfg["disables"])
+
+        for name in monitors_to_disable:
+            if name in monitors_by_name:
+                monitors_by_name[name]["to_disable"] = True
+
+        return {k: v for k, v in monitors_by_name.items() if not v.get("to_disable")}
+
     def _build_graph(
         self, config: dict[str, Any], monitors_by_name: dict[str, MonitorInfo]
     ) -> tuple[dict[str, list[tuple[str, str]]], dict[str, int]]:
@@ -108,20 +230,18 @@ class Extension(Plugin):
             config: Configuration dictionary
             monitors_by_name: Mapping of monitor names to info
         """
-        tree: dict[str, list[tuple[str, str]]] = defaultdict(list)
-        in_degree: dict[str, int] = defaultdict(int)
+        tree, in_degree, multi_target_info = build_graph(config, monitors_by_name)
 
-        for name in monitors_by_name:
-            in_degree[name] = 0
+        # Log warnings for multiple targets
+        for name, rule_name, target_names in multi_target_info:
+            self.log.debug(
+                "Multiple targets for %s.%s: %s - using first: %s",
+                name,
+                rule_name,
+                target_names,
+                target_names[0],
+            )
 
-        for name, rules in config.items():
-            for rule_name, target_names in rules.items():
-                if rule_name in MONITOR_PROPS or rule_name == "disables":
-                    continue
-                target_name = target_names[0] if target_names else None
-                if target_name and target_name in monitors_by_name:
-                    tree[target_name].append((name, rule_name))
-                    in_degree[name] += 1
         return tree, in_degree
 
     def _compute_positions(
@@ -139,35 +259,16 @@ class Extension(Plugin):
             in_degree: In-degree of each node in the graph
             config: Configuration dictionary
         """
-        queue = [name for name in monitors_by_name if in_degree[name] == 0]
-        positions: dict[str, tuple[int, int]] = {}
-        for name in queue:
-            positions[name] = (monitors_by_name[name]["x"], monitors_by_name[name]["y"])
+        positions, unprocessed = compute_positions(monitors_by_name, tree, in_degree, config)
 
-        processed = set()
-        while queue:
-            ref_name = queue.pop(0)
-            if ref_name in processed:
-                continue
-            processed.add(ref_name)
+        # Check for unprocessed monitors (indicates circular dependencies)
+        if unprocessed:
+            cycle_info = find_cycle_path(config, unprocessed)
+            self.log.warning(
+                "Circular dependency detected: %s. Ensure at least one monitor has no placement rule (anchor).",
+                cycle_info,
+            )
 
-            for child_name, rule in tree[ref_name]:
-                ref_rect = (
-                    *positions[ref_name],
-                    *get_dims(monitors_by_name[ref_name], config.get(ref_name, {})),
-                )
-
-                mon_dim = get_dims(monitors_by_name[child_name], config.get(child_name, {}))
-
-                positions[child_name] = compute_xy(
-                    ref_rect,
-                    mon_dim,
-                    rule,
-                )
-
-                in_degree[child_name] -= 1
-                if in_degree[child_name] == 0:
-                    queue.append(child_name)
         return positions
 
     async def _apply_layout(
@@ -187,6 +288,9 @@ class Extension(Plugin):
         if not positions and not has_disabled:
             return False
 
+        if self.state.environment == "niri":
+            return await self._apply_niri_layout(positions, monitors_by_name, config)
+
         if positions:
             min_x = min(x for x, y in positions.values())
             min_y = min(y for x, y in positions.values())
@@ -200,34 +304,57 @@ class Extension(Plugin):
             mon["x"] = x - min_x
             mon["y"] = y - min_y
             mon_config = config.get(name, {})
-            cmd = self._build_monitor_command(mon, mon_config)
+            cmd = build_hyprland_command(mon, mon_config)
             cmds.append(cmd)
 
         for name, mon in monitors_by_name.items():
             if mon.get("to_disable"):
                 cmds.append(f"monitor {name},disable")
 
+        # Set ignore window before triggering config reload via hyprctl keyword
+        self._relayout_debouncer.set_ignore_window()
+
         for cmd in cmds:
             self.log.debug(cmd)
-            await self.hyprctl(cmd, "keyword")
+            await self.backend.execute(cmd, base_command="keyword")
         return True
 
-    def _build_monitor_command(self, monitor: MonitorInfo, config: dict[str, Any]) -> str:
-        """Build the monitor command.
+    async def _apply_niri_layout(
+        self,
+        positions: dict[str, tuple[int, int]],
+        monitors_by_name: dict[str, MonitorInfo],
+        config: dict[str, Any],
+    ) -> bool:
+        """Apply Niri layout.
 
         Args:
-            monitor: Monitor information
-            config: Configuration for the monitor
+            positions: Computed (x, y) positions for each monitor
+            monitors_by_name: Mapping of monitor names to info
+            config: Configuration dictionary
         """
-        name = monitor["name"]
-        rate = config.get("rate", monitor["refreshRate"])
-        res = config.get("resolution", f"{monitor['width']}x{monitor['height']}")
-        if isinstance(res, list):
-            res = f"{res[0]}x{res[1]}"
-        scale = config.get("scale", monitor["scale"])
-        position = f"{monitor['x']}x{monitor['y']}"
-        transform = config.get("transform", monitor["transform"])
-        return f"monitor {name},{res}@{rate},{position},{scale},transform,{transform}"
+        # Handle disabled monitors first
+        for name, mon in monitors_by_name.items():
+            if mon.get("to_disable"):
+                await self.backend.execute(build_niri_disable_action(name))
+
+        # Apply positions and settings for enabled monitors
+        for name, (x, y) in positions.items():
+            # Set position
+            await self.backend.execute(build_niri_position_action(name, x, y))
+
+            mon_config = config.get(name, {})
+
+            # Set scale if configured
+            scale = mon_config.get("scale")
+            if scale:
+                await self.backend.execute(build_niri_scale_action(name, scale))
+
+            # Set transform if configured
+            transform = mon_config.get("transform")
+            if transform is not None:
+                await self.backend.execute(build_niri_transform_action(name, transform))
+
+        return True
 
     def _resolve_names(self, monitors: list[MonitorInfo]) -> dict[str, Any]:
         """Resolve configuration patterns to actual monitor names.
@@ -235,37 +362,11 @@ class Extension(Plugin):
         Args:
             monitors: List of available monitors
         """
-        monitors_by_descr = {m["description"]: m for m in monitors}
-        monitors_by_name = {m["name"]: m for m in monitors}
-
-        cleaned_config: dict[str, dict[str, Any]] = {}
-
-        for pat, rules in self.config.get("placement", {}).items():
-            # Find the subject monitor
-            mon = self._get_mon_by_pat(pat, monitors_by_descr, monitors_by_name)
-            if not mon:
-                continue
-
-            name = mon["name"]
-            cleaned_config[name] = {}
-
-            for rule_key, rule_val in rules.items():
-                if rule_key in MONITOR_PROPS:
-                    cleaned_config[name][rule_key] = rule_val
-                    continue
-
-                # Resolve target monitors in the rule
-                targets = []
-                val_list = [rule_val] if isinstance(rule_val, str) else rule_val
-                for target_pat in val_list:
-                    target_mon = self._get_mon_by_pat(target_pat, monitors_by_descr, monitors_by_name)
-                    if target_mon:
-                        targets.append(target_mon["name"])
-
-                if targets:
-                    cleaned_config[name][rule_key] = targets
-
-        return cleaned_config
+        return resolve_placement_config(
+            self.get_config_dict("placement"),
+            monitors,
+            self._mon_by_pat_cache,
+        )
 
     async def _hotplug_command(self, monitors: list[MonitorInfo], name: str) -> None:
         """Run the hotplug command for the monitor.
@@ -276,39 +377,15 @@ class Extension(Plugin):
         """
         monitors_by_descr = {m["description"]: m for m in monitors}
         monitors_by_name = {m["name"]: m for m in monitors}
-        for descr, command in self.config.get("hotplug_commands", {}).items():
-            mon = self._get_mon_by_pat(descr, monitors_by_descr, monitors_by_name)
+        for descr, command in self.get_config_dict("hotplug_commands").items():
+            mon = get_monitor_by_pattern(descr, monitors_by_descr, monitors_by_name, self._mon_by_pat_cache)
             if mon and mon["name"] == name:
                 await asyncio.create_subprocess_shell(command)
                 break
-        single_command = self.config.get("hotplug_command")
+        single_command = self.get_config_str("hotplug_command")
         if single_command:
             await asyncio.create_subprocess_shell(single_command)
 
     def _clear_mon_by_pat_cache(self) -> None:
         """Clear the cache."""
         self._mon_by_pat_cache = {}
-
-    def _get_mon_by_pat(self, pat: str, description_db: dict[str, MonitorInfo], name_db: dict[str, MonitorInfo]) -> MonitorInfo | None:
-        """Return a (plugged) monitor object given its pattern or none if not found.
-
-        Args:
-            pat: Pattern to search for
-            description_db: Database of monitors by description
-            name_db: Database of monitors by name
-        """
-        cached = self._mon_by_pat_cache.get(pat)
-        if cached:
-            return cached
-
-        if pat in name_db:
-            cached = name_db[pat]
-        else:
-            for full_descr, mon in description_db.items():
-                if pat in full_descr:
-                    cached = mon
-                    break
-
-        if cached:
-            self._mon_by_pat_cache[pat] = cached
-        return cached

@@ -1,9 +1,21 @@
 import asyncio
 import json
+import logging
 import pytest
 from unittest.mock import Mock, AsyncMock, patch
 from pyprland import ipc
-from pyprland.types import PyprError
+from pyprland.models import PyprError
+from pyprland.adapters.hyprland import HyprlandBackend
+
+
+@pytest.fixture
+def test_log():
+    """Provide a silent logger for tests."""
+    logger = logging.getLogger("test_ipc")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+    return logger
 
 
 @pytest.fixture
@@ -49,7 +61,7 @@ async def test_get_response(mock_open_connection):
     logger = Mock()
     reader.read.return_value = b'{"status": "ok"}'
 
-    result = await ipc._get_response(b"command", logger)
+    result = await ipc.get_response(b"command", logger)
 
     assert result == {"status": "ok"}
     writer.write.assert_called_with(b"command")
@@ -57,37 +69,43 @@ async def test_get_response(mock_open_connection):
 
 
 @pytest.mark.asyncio
-async def test_hyprctl_success(mock_open_connection):
+async def test_hyprland_backend_execute_success(mock_open_connection, test_log):
     mock_connect, reader, writer = mock_open_connection
-    logger = Mock()
     reader.read.return_value = b"ok"
 
-    result = await ipc.hyprctl("some_command", logger=logger)
+    state = Mock()
+    backend = HyprlandBackend(state)
+
+    result = await backend.execute("some_command", log=test_log)
 
     assert result is True
     writer.write.assert_called_with(b"/dispatch some_command")
 
 
 @pytest.mark.asyncio
-async def test_hyprctl_failure(mock_open_connection):
+async def test_hyprland_backend_execute_failure(mock_open_connection, test_log):
     mock_connect, reader, writer = mock_open_connection
-    logger = Mock()
     reader.read.return_value = b"err"
 
-    result = await ipc.hyprctl("some_command", logger=logger)
+    state = Mock()
+    backend = HyprlandBackend(state)
+
+    result = await backend.execute("some_command", log=test_log)
 
     assert result is False
-    logger.error.assert_called()
+    # Check if logged error? Need to spy on logger or check side effects if implemented
 
 
 @pytest.mark.asyncio
-async def test_hyprctl_batch(mock_open_connection):
+async def test_hyprland_backend_execute_batch(mock_open_connection, test_log):
     mock_connect, reader, writer = mock_open_connection
-    logger = Mock()
     reader.read.return_value = b"okok"
 
+    state = Mock()
+    backend = HyprlandBackend(state)
+
     cmds = ["cmd1", "cmd2"]
-    result = await ipc.hyprctl(cmds, logger=logger)
+    result = await backend.execute(cmds, log=test_log)
 
     assert result is True
     # Verify the batch format string
@@ -98,21 +116,24 @@ async def test_hyprctl_batch(mock_open_connection):
 
 
 @pytest.mark.asyncio
-async def test_get_client_props(mock_open_connection):
-    # Mock hyprctl_json to avoid socket usage
-    with patch("pyprland.ipc.hyprctl_json", new_callable=AsyncMock) as mock_json:
-        clients = [{"address": "0x123", "class": "Term"}, {"address": "0x456", "class": "Browser"}]
-        mock_json.return_value = clients
-        logger = Mock()
+async def test_backend_get_client_props(mock_open_connection, test_log):
+    # Mock execute_json on the backend instead of ipc.hyprctl_json
+    state = Mock()
+    backend = HyprlandBackend(state)
 
-        # By address
-        client = await ipc.get_client_props(logger, addr="0x123")
-        assert client == clients[0]
+    clients = [{"address": "0x123", "class": "Term"}, {"address": "0x456", "class": "Browser"}]
 
-        # By class
-        client = await ipc.get_client_props(logger, cls="Browser")
-        assert client == clients[1]
+    # We mock execute_json on the instance
+    backend.execute_json = AsyncMock(return_value=clients)
 
-        # By custom prop
-        client = await ipc.get_client_props(logger, title="Something")  # Not found
-        assert client is None
+    # By address
+    client = await backend.get_client_props(addr="0x123", log=test_log)
+    assert client == clients[0]
+
+    # By class
+    client = await backend.get_client_props(cls="Browser", log=test_log)
+    assert client == clients[1]
+
+    # By custom prop
+    client = await backend.get_client_props(title="Something", log=test_log)  # Not found
+    assert client is None

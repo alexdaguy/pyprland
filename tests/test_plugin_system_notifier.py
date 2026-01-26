@@ -8,8 +8,7 @@ from pyprland.plugins.system_notifier import Extension, builtin_parsers
 @pytest_asyncio.fixture
 async def extension():
     ext = Extension("system_notifier")
-    ext.hyprctl = AsyncMock()
-    ext.notify = AsyncMock()
+    ext.backend = AsyncMock()
     ext.log = Mock()
     ext.config = {"parsers": {}, "sources": [], "default_color": "#000000"}
     yield ext
@@ -98,13 +97,13 @@ async def test_parser_matching(extension):
         await q.put("Error: Database connection lost")
         await asyncio.sleep(0.01)
 
-        extension.notify.assert_called_with("Something failed: Database connection lost", color=0xFF0000, duration=5)
+        extension.backend.notify.assert_called_with("Something failed: Database connection lost", color=0xFF0000, duration=5)
 
     # Feed non-matching content
-    extension.notify.reset_mock()
+    extension.backend.notify.reset_mock()
     await q.put("Info: All systems go")
     await asyncio.sleep(0.01)
-    extension.notify.assert_not_called()
+    extension.backend.notify.assert_not_called()
 
     # Clean up
     extension.running = False
@@ -123,26 +122,27 @@ async def test_notify_send_option(extension):
 
     props = [{"pattern": r"Match me", "duration": 2}]
 
-    task = asyncio.create_task(extension.start_parser("test_parser", props))
-    await asyncio.sleep(0.01)
+    with patch("pyprland.plugins.system_notifier.notify_send", new_callable=AsyncMock) as mock_notify_send:
+        task = asyncio.create_task(extension.start_parser("test_parser", props))
+        await asyncio.sleep(0.01)
 
-    await q.put("Match me")
-    await asyncio.sleep(0.01)
+        await q.put("Match me")
+        await asyncio.sleep(0.01)
 
-    # Should use hyprctl exec notify-send instead of self.notify
-    extension.notify.assert_not_called()
-    extension.hyprctl.assert_called_once()
-    args = extension.hyprctl.call_args[0][0]
-    assert "notify-send" in args
-    assert "'Match me'" in args
-    assert "--expire-time=2000" in args
+        # Should use notify_send instead of self.backend.notify
+        extension.backend.notify.assert_not_called()
 
-    extension.running = False
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+        mock_notify_send.assert_called_once()
+        args, kwargs = mock_notify_send.call_args
+        assert args[0] == "Match me"
+        assert kwargs["duration"] == 2000
+
+        extension.running = False
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 @pytest.mark.asyncio
@@ -152,13 +152,13 @@ async def test_exit_cleanup(extension):
     extension.tasks.append(t1)
 
     mock_proc = Mock()
-    mock_proc.pid = 1234
-    mock_proc.kill = Mock()
+    mock_proc.stop = AsyncMock()
     extension.sources["cmd"] = mock_proc
 
     await extension.exit()
 
     assert extension.running is False
     assert t1.cancelled()
-    mock_proc.kill.assert_called_once()
+    mock_proc.stop.assert_called_once()
     assert extension.tasks == []
+    assert extension.sources == {}

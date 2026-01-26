@@ -6,8 +6,9 @@ from pyprland.plugins.lost_windows import Extension, contains
 @pytest.fixture
 def extension():
     ext = Extension("lost_windows")
-    ext.hyprctl = AsyncMock()
-    ext.hyprctl_json = AsyncMock()
+    ext.backend = AsyncMock()
+    ext.hyprctl = ext.backend.execute
+    ext.hyprctl_json = ext.backend.execute_json
     ext.get_clients = AsyncMock()
     return ext
 
@@ -29,7 +30,8 @@ def test_contains():
 
 @pytest.mark.asyncio
 async def test_run_attract_lost(extension):
-    monitors = [{"id": 1, "name": "DP-1", "width": 1920, "height": 1080, "x": 0, "y": 0, "focused": True, "activeWorkspace": {"id": 1}}]
+    monitor = {"id": 1, "name": "DP-1", "width": 1920, "height": 1080, "x": 0, "y": 0, "focused": True, "activeWorkspace": {"id": 1}}
+    monitors = [monitor]
 
     # One window inside, one lost
     clients = [
@@ -38,7 +40,8 @@ async def test_run_attract_lost(extension):
         {"pid": 3, "floating": False, "at": [3000, 3000], "class": "tiled_lost_ignored"},
     ]
 
-    extension.hyprctl_json.return_value = monitors
+    extension.backend.get_monitors.return_value = monitors
+    extension.backend.get_monitor_props.return_value = monitor
     extension.get_clients.return_value = clients
 
     await extension.run_attract_lost()

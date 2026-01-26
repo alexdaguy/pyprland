@@ -1,18 +1,29 @@
 """expose Brings every client window to screen for selection."""
 
-from ..types import ClientInfo
+from ..models import ClientInfo
+from ..validation import ConfigField, ConfigItems
 from .interface import Plugin
 
 
-class Extension(Plugin):  # pylint: disable=missing-class-docstring
-    """Expose all clients on the active workspace."""
+class Extension(Plugin):
+    """Exposes all windows for a quick 'jump to' feature."""
 
-    exposed: list[ClientInfo] = []
+    environments = ["hyprland"]
+
+    config_schema = ConfigItems(
+        ConfigField("include_special", bool, default=False, description="Include windows from special workspaces"),
+    )
+
+    exposed: list[ClientInfo]
+
+    async def on_reload(self) -> None:
+        """Initialize exposed list on reload."""
+        self.exposed = []
 
     @property
     def exposed_clients(self) -> list[ClientInfo]:
         """Returns the list of clients currently using exposed mode."""
-        if self.config.get_bool("include_special", False):
+        if self.get_config_bool("include_special"):
             return self.exposed
         return [c for c in self.exposed if c["workspace"]["id"] > 0]
 
@@ -31,7 +42,7 @@ class Extension(Plugin):  # pylint: disable=missing-class-docstring
                     f"focuswindow address:{self.state.active_window}",
                 )
             )
-            await self.hyprctl(commands)
+            await self.backend.execute(commands)
             self.exposed = []
         else:
             self.exposed = await self.get_clients(workspace_bl=self.state.active_workspace)
@@ -39,4 +50,4 @@ class Extension(Plugin):  # pylint: disable=missing-class-docstring
             for client in self.exposed_clients:
                 commands.append(f"movetoworkspacesilent special:exposed,address:{client['address']}")
             commands.append("togglespecialworkspace exposed")
-            await self.hyprctl(commands)
+            await self.backend.execute(commands)

@@ -3,12 +3,20 @@
 import asyncio
 from collections.abc import Iterable
 
-from ..types import VersionInfo
+from ..models import VersionInfo
+from ..validation import ConfigField, ConfigItems
 from .interface import Plugin
 
 
 class Extension(Plugin):
-    """Control workspace zooming."""
+    """Toggles zooming of viewport or sets a specific scaling factor."""
+
+    environments = ["hyprland"]
+
+    config_schema = ConfigItems(
+        ConfigField("factor", float, default=2.0, description="Zoom factor when toggling"),
+        ConfigField("duration", int, default=0, description="Animation duration in frames (0 to disable)"),
+    )
 
     zoomed = False
 
@@ -54,7 +62,7 @@ class Extension(Plugin):
         If factor is omitted, it toggles between the configured zoom level and no zoom.
         Factor can be relative (e.g. +0.5 or -0.5).
         """
-        duration = self.config.get("duration", 0)
+        duration = self.get_config_int("duration")
         animated = bool(duration)
         prev_factor = self.cur_factor
         expo = False
@@ -74,7 +82,7 @@ class Extension(Plugin):
         elif self.zoomed:
             self.cur_factor = 1
         else:
-            self.cur_factor = float(self.config.get("factor", 2.0))
+            self.cur_factor = self.get_config_float("factor")
 
         self.cur_factor = max(self.cur_factor, 1)
 
@@ -82,8 +90,8 @@ class Extension(Plugin):
             start = int((2.0 ** (prev_factor - 1) if expo else prev_factor) * 10)
             end = int((2.0 ** (self.cur_factor - 1) if expo else self.cur_factor) * 10)
             for i in self.animated_eased_zoom(start, end, duration):
-                await self.hyprctl(f"{self.keyword} {i / 10:.4f}", "keyword")
+                await self.backend.execute(f"{self.keyword} {i / 10:.4f}", base_command="keyword")
                 await asyncio.sleep(1.0 / 60)
         self.zoomed = self.cur_factor != 1
         factor = 2 ** (self.cur_factor - 1) if expo else self.cur_factor
-        await self.hyprctl(f"{self.keyword} {factor:.4f}", "keyword")
+        await self.backend.execute(f"{self.keyword} {factor:.4f}", base_command="keyword")

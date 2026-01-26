@@ -10,8 +10,9 @@ def extension():
     ext.state = SharedState()
     ext.state.active_workspace = "1"
     ext.state.active_window = "0x1"
-    ext.hyprctl = AsyncMock()
-    ext.hyprctl_json = AsyncMock()
+    ext.backend = AsyncMock()
+    ext.hyprctl = ext.backend.execute
+    ext.hyprctl_json = ext.backend.execute_json
     ext.notify_error = AsyncMock()
     ext.workspace_info = {"1": {"enabled": True, "addr": "0x1"}}
     ext.config.update({"margin": 50, "offset": "10 20"})
@@ -43,9 +44,8 @@ async def test_sanity_check_passes(extension):
 
 @pytest.mark.asyncio
 async def test_calculate_geometry(extension):
-    extension.hyprctl_json.return_value = [
-        {"name": "DP-1", "focused": True, "scale": 1.0, "width": 1920, "height": 1080, "x": 0, "y": 0, "transform": 0}
-    ]
+    monitor = {"name": "DP-1", "focused": True, "scale": 1.0, "width": 1920, "height": 1080, "x": 0, "y": 0, "transform": 0}
+    extension.backend.get_monitor_props.return_value = monitor
 
     # margin 50, offset 10 20
     # width = 1920 - 100 = 1820
@@ -72,7 +72,7 @@ async def test_change_focus_next(extension):
     await extension._run_changefocus(1)
 
     assert extension.main_window_addr == "0x2"
-    extension.hyprctl.assert_called_with("focuswindow address:0x2")
+    extension.backend.focus_window.assert_called_with("0x2")
 
 
 @pytest.mark.asyncio
@@ -87,4 +87,4 @@ async def test_change_focus_prev_wrap(extension):
     await extension._run_changefocus(-1)
 
     assert extension.main_window_addr == "0x3"
-    extension.hyprctl.assert_called_with("focuswindow address:0x3")
+    extension.backend.focus_window.assert_called_with("0x3")

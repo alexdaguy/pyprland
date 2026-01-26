@@ -1,7 +1,7 @@
 """Conversion functions for units used in Pyprland & plugins."""
 
 from ..common import is_rotated
-from ..types import MonitorInfo
+from ..models import MonitorInfo
 
 def convert_negative_dimension(size: int, ref_value: float) -> int:
     """Returns the original dimension if non-negative, otherwise returns the
