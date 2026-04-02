@@ -2,17 +2,16 @@
 
 from typing import cast
 
+from ..models import Environment
 from ..validation import ConfigField, ConfigItems
 from .interface import Plugin
 
 
-class Extension(Plugin):
+class Extension(Plugin, environments=[Environment.HYPRLAND]):
     """Toggle switching the focused window to a special workspace."""
 
-    environments = ["hyprland"]
-
     config_schema = ConfigItems(
-        ConfigField("name", str, default="minimized", description="Default special workspace name"),
+        ConfigField("name", str, default="minimized", description="Default special workspace name", category="basic"),
     )
 
     async def run_toggle_special(self, special_workspace: str = "minimized") -> None:
@@ -23,11 +22,10 @@ class Extension(Plugin):
         """
         aw = cast("dict", await self.backend.execute_json("activewindow"))
         wid = aw["workspace"]["id"]
-        assert isinstance(wid, int)
         if wid < 1:  # special workspace
+            await self.backend.execute(f"togglespecialworkspace {special_workspace}")
             await self.backend.execute(
                 [
-                    f"togglespecialworkspace {special_workspace}",
                     f"movetoworkspacesilent {self.state.active_workspace},address:{aw['address']}",
                     f"focuswindow address:{aw['address']}",
                 ]

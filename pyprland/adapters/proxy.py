@@ -41,7 +41,7 @@ class BackendProxy:
 
     # === Core execution methods ===
 
-    async def execute(self, command: str | list | dict, **kwargs: Any) -> bool:  # noqa: ANN401
+    async def execute(self, command: str | list | dict, **kwargs: Any) -> bool:
         """Execute a command (or list of commands).
 
         Args:
@@ -53,7 +53,7 @@ class BackendProxy:
         """
         return await self._backend.execute(command, log=self.log, **kwargs)
 
-    async def execute_json(self, command: str, **kwargs: Any) -> Any:  # noqa: ANN401
+    async def execute_json(self, command: str, **kwargs: Any) -> Any:
         """Execute a command and return the JSON result.
 
         Args:
@@ -124,7 +124,7 @@ class BackendProxy:
         self,
         match_fn: Callable[[Any, Any], bool] | None = None,
         clients: list[ClientInfo] | None = None,
-        **kw: Any,  # noqa: ANN401
+        **kw: Any,
     ) -> ClientInfo | None:
         """Return the properties of a client matching the given criteria.
 
@@ -211,16 +211,17 @@ class BackendProxy:
         """
         return await self._backend.pin_window(address, log=self.log)
 
-    async def close_window(self, address: str) -> bool:
+    async def close_window(self, address: str, silent: bool = True) -> bool:
         """Close a window.
 
         Args:
             address: Window address (without 'address:' prefix)
+            silent: If True, don't shift focus (default: True)
 
         Returns:
             True if command succeeded
         """
-        return await self._backend.close_window(address, log=self.log)
+        return await self._backend.close_window(address, silent=silent, log=self.log)
 
     async def resize_window(self, address: str, width: int, height: int) -> bool:
         """Resize a window to exact pixel dimensions.

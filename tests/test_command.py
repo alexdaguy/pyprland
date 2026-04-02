@@ -4,7 +4,8 @@ import asyncio
 import sys
 import os
 import tempfile
-from pyprland.command import Pyprland
+from pathlib import Path
+from pyprland.manager import Pyprland
 from pyprland.models import ExitCode, PyprError
 from pyprland.validate_cli import run_validate, _load_plugin_module
 
@@ -16,6 +17,7 @@ def pyprland_app():
         app = Pyprland()
         app.server = AsyncMock()
         app.event_reader = AsyncMock()
+        app.log_handler = Mock()  # Required for _run_plugin_handler
         return app
 
 
@@ -25,8 +27,9 @@ async def test_load_config_toml(pyprland_app):
     mock_toml = {"pyprland": {"plugins": ["test_plug"]}}
 
     with (
-        patch("os.path.exists", return_value=True),
-        patch("builtins.open", new_callable=MagicMock),
+        patch("pyprland.config_loader.aiexists", AsyncMock(return_value=True)),
+        patch("pathlib.Path.exists", return_value=True),
+        patch("pathlib.Path.open", new_callable=MagicMock),
         patch("tomllib.load", return_value=mock_toml),
         patch("pyprland.ipc._state.log", new=Mock()),  # Mock the logger used in ipc module
     ):
@@ -58,8 +61,9 @@ async def test_load_config_toml_with_notify(pyprland_app):
     mock_toml = {"pyprland": {"plugins": ["test_plug"]}}
 
     with (
-        patch("os.path.exists", return_value=True),
-        patch("builtins.open", new_callable=MagicMock),
+        patch("pyprland.config_loader.aiexists", AsyncMock(return_value=True)),
+        patch("pathlib.Path.exists", return_value=True),
+        patch("pathlib.Path.open", new_callable=MagicMock),
         patch("tomllib.load", return_value=mock_toml),
     ):
         pyprland_app.backend.notify_info = AsyncMock()
@@ -86,16 +90,21 @@ async def test_load_config_json_fallback(pyprland_app):
     """Test fallback to JSON if TOML doesn't exist."""
     mock_json = {"pyprland": {"plugins": []}}
 
-    # Sequence of exists checks:
-    # 1. __open_config: OLD exists? -> True
-    # 2. __open_config: NEW exists? -> False (Triggers warning)
-    # 3. __load_config_file: NEW exists? -> False
-    # 4. __load_config_file: OLD exists? -> True
-    side_effects = [True, False, False, True]
+    # Async exists checks in _open_config:
+    # 1. CONFIG_FILE exists? -> False
+    # 2. LEGACY_CONFIG_FILE exists? -> False
+    # 3. OLD_CONFIG_FILE exists? -> True (triggers warning)
+    async_side_effects = [False, False, True]
+
+    # Sync exists checks in _load_config_file:
+    # 4. fname (CONFIG_FILE) exists? -> False
+    # 5. OLD_CONFIG_FILE exists? -> True
+    sync_side_effects = [False, True]
 
     with (
-        patch("os.path.exists", side_effect=side_effects),
-        patch("builtins.open", new_callable=MagicMock),
+        patch("pyprland.config_loader.aiexists", AsyncMock(side_effect=async_side_effects)),
+        patch.object(Path, "exists", side_effect=sync_side_effects),
+        patch.object(Path, "open", new_callable=MagicMock),
         patch("json.loads", return_value=mock_json),
     ):
         pyprland_app.backend.notify_info = AsyncMock()
@@ -116,7 +125,10 @@ async def test_load_config_json_fallback(pyprland_app):
 @pytest.mark.asyncio
 async def test_load_config_missing(pyprland_app):
     """Test error raised when no config found."""
-    with patch("os.path.exists", return_value=False):
+    with (
+        patch("pyprland.config_loader.aiexists", AsyncMock(return_value=False)),
+        patch.object(Path, "exists", return_value=False),
+    ):
         with pytest.raises(PyprError):
             await pyprland_app.load_config()
 
@@ -180,10 +192,11 @@ async def test_call_handler_dispatch(pyprland_app):
     p2.run_mycommand = AsyncMock()
 
     with patch("pyprland.manager.partial") as mock_partial:
-        handled, error_msg = await pyprland_app._call_handler("run_mycommand", "arg1")
+        handled, success, msg = await pyprland_app._call_handler("run_mycommand", "arg1")
 
         assert handled is True
-        assert error_msg == ""
+        assert success is True
+        assert msg == ""
         # Verify it was queued for p2
         assert pyprland_app.queues["p2"].qsize() == 1
 
@@ -216,10 +229,11 @@ async def test_call_handler_dispatch_with_wait(pyprland_app):
     processor_task = asyncio.create_task(queue_processor())
 
     try:
-        handled, error_msg = await pyprland_app._call_handler("run_mycommand", "arg1", wait=True)
+        handled, success, msg = await pyprland_app._call_handler("run_mycommand", "arg1", wait=True)
 
         assert handled is True
-        assert error_msg == ""
+        assert success is True
+        assert msg == ""
         p1.run_mycommand.assert_called_once_with("arg1")
     finally:
         # Stop the processor
@@ -233,10 +247,11 @@ async def test_call_handler_unknown_command(pyprland_app):
     pyprland_app.plugins = {}
     pyprland_app.backend.notify_info = AsyncMock()
 
-    handled, error_msg = await pyprland_app._call_handler("run_nonexistent", notify="nonexistent")
+    handled, success, msg = await pyprland_app._call_handler("run_nonexistent", notify="nonexistent")
 
     assert handled is False
-    assert "Unknown command" in error_msg
+    assert success is False
+    assert "Unknown command" in msg
     pyprland_app.backend.notify_info.assert_called()
 
 
@@ -253,8 +268,8 @@ async def test_read_command_socket(pyprland_app):
     reader.readline.return_value = b"reload\n"
 
     with patch.object(pyprland_app, "_call_handler", new_callable=AsyncMock) as mock_call:
-        # Mock returns (handled=True, error_msg="")
-        mock_call.return_value = (True, "")
+        # Mock returns (handled=True, success=True, msg="")
+        mock_call.return_value = (True, True, "")
         await pyprland_app.read_command(reader, writer)
 
         mock_call.assert_called_with("run_reload", notify="reload", wait=True)
@@ -274,8 +289,8 @@ async def test_read_command_socket_error(pyprland_app):
     reader.readline.return_value = b"failing_command\n"
 
     with patch.object(pyprland_app, "_call_handler", new_callable=AsyncMock) as mock_call:
-        # Mock returns (handled=True, error_msg="Something went wrong")
-        mock_call.return_value = (True, "test_plugin::run_failing: Exception occurred")
+        # Mock returns (handled=True, success=False, msg="error message")
+        mock_call.return_value = (True, False, "test_plugin::run_failing: Exception occurred")
         await pyprland_app.read_command(reader, writer)
 
         # Verify ERROR response was sent
@@ -295,8 +310,8 @@ async def test_read_command_socket_unknown(pyprland_app):
     reader.readline.return_value = b"unknown_cmd\n"
 
     with patch.object(pyprland_app, "_call_handler", new_callable=AsyncMock) as mock_call:
-        # Mock returns (handled=False, error_msg="Unknown command")
-        mock_call.return_value = (False, 'Unknown command "unknown_cmd". Try "help" for available commands.')
+        # Mock returns (handled=False, success=False, msg="Unknown command")
+        mock_call.return_value = (False, False, 'Unknown command "unknown_cmd". Try "help" for available commands.')
         await pyprland_app.read_command(reader, writer)
 
         # Verify ERROR response was sent
@@ -315,6 +330,13 @@ async def test_read_command_exit(pyprland_app):
     writer.close = Mock()
 
     reader.readline.return_value = b"exit\n"
+
+    # Set up the pyprland plugin with manager reference so run_exit works
+    from pyprland.plugins.pyprland import Extension
+
+    pyprland_plugin = Extension("pyprland")
+    pyprland_plugin.manager = pyprland_app
+    pyprland_app.plugins["pyprland"] = pyprland_plugin
 
     with patch.object(pyprland_app, "_abort_plugins", new_callable=AsyncMock) as mock_abort:
         await pyprland_app.read_command(reader, writer)
@@ -341,9 +363,9 @@ def test_load_plugin_module_not_found():
 def test_run_validate_valid_config():
     """Test validate command with a valid config."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        config_dir = os.path.join(tmpdir, ".config", "hypr")
+        config_dir = os.path.join(tmpdir, "hypr")
         os.makedirs(config_dir)
-        config_file = os.path.join(config_dir, "pyprland.toml")
+        config_file = Path(config_dir) / "pyprland.toml"
 
         # Write a valid config
         with open(config_file, "w") as f:
@@ -356,7 +378,12 @@ factor = 2.5
 duration = 10
 """)
 
-        with patch.dict(os.environ, {"HOME": tmpdir}):
+        # Patch the constants to use our temp paths
+        with (
+            patch("pyprland.validate_cli.CONFIG_FILE", Path(tmpdir) / "pypr" / "config.toml"),
+            patch("pyprland.validate_cli.LEGACY_CONFIG_FILE", config_file),
+            patch("pyprland.validate_cli.OLD_CONFIG_FILE", Path(tmpdir) / "hypr" / "pyprland.json"),
+        ):
             with pytest.raises(SystemExit) as exc_info:
                 run_validate()
             assert exc_info.value.code == ExitCode.SUCCESS
@@ -365,9 +392,9 @@ duration = 10
 def test_run_validate_missing_required_field():
     """Test validate command with missing required field."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        config_dir = os.path.join(tmpdir, ".config", "hypr")
+        config_dir = os.path.join(tmpdir, "hypr")
         os.makedirs(config_dir)
-        config_file = os.path.join(config_dir, "pyprland.toml")
+        config_file = Path(config_dir) / "pyprland.toml"
 
         # Write a config with missing required "path" field for wallpapers
         with open(config_file, "w") as f:
@@ -379,7 +406,12 @@ plugins = ["wallpapers"]
 interval = 10
 """)
 
-        with patch.dict(os.environ, {"HOME": tmpdir}):
+        # Patch the constants to use our temp paths
+        with (
+            patch("pyprland.validate_cli.CONFIG_FILE", Path(tmpdir) / "pypr" / "config.toml"),
+            patch("pyprland.validate_cli.LEGACY_CONFIG_FILE", config_file),
+            patch("pyprland.validate_cli.OLD_CONFIG_FILE", Path(tmpdir) / "hypr" / "pyprland.json"),
+        ):
             with pytest.raises(SystemExit) as exc_info:
                 run_validate()
             # Should fail with USAGE_ERROR due to missing required field
@@ -389,7 +421,12 @@ interval = 10
 def test_run_validate_config_not_found():
     """Test validate command when config file doesn't exist."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        with patch.dict(os.environ, {"HOME": tmpdir}):
+        # Patch the constants to use non-existent paths in temp directory
+        with (
+            patch("pyprland.validate_cli.CONFIG_FILE", Path(tmpdir) / "pypr" / "config.toml"),
+            patch("pyprland.validate_cli.LEGACY_CONFIG_FILE", Path(tmpdir) / "hypr" / "pyprland.toml"),
+            patch("pyprland.validate_cli.OLD_CONFIG_FILE", Path(tmpdir) / "hypr" / "pyprland.json"),
+        ):
             with pytest.raises(SystemExit) as exc_info:
                 run_validate()
             assert exc_info.value.code == ExitCode.ENV_ERROR

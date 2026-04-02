@@ -1,12 +1,12 @@
 """Run a bar."""
 
-import asyncio
 import contextlib
-import os
 from time import time
 from typing import TYPE_CHECKING, cast
 
+from ..aioops import TaskManager, aiexists
 from ..common import apply_variables
+from ..models import Environment, ReloadReason
 from ..process import ManagedProcess
 from ..validation import ConfigField, ConfigItems
 from .interface import Plugin
@@ -14,7 +14,9 @@ from .interface import Plugin
 if TYPE_CHECKING:
     from ..adapters.proxy import BackendProxy
 
-COOLDOWN_TIME = 60
+CRASH_COOLDOWN = 120  # seconds - crashes within this trigger backoff
+MAX_BACKOFF_DELAY = 60  # cap at 60 seconds
+BASE_DELAY = 2  # base for exponential calculation
 IDLE_LOOP_INTERVAL = 10
 
 
@@ -61,7 +63,7 @@ async def is_bar_alive(
         environment: Current environment ("hyprland" or "niri")
     """
     # First check /proc - works for any spawned process
-    is_running = os.path.exists(f"/proc/{pid}")
+    is_running = await aiexists(f"/proc/{pid}")
     if is_running:
         return pid
 
@@ -84,10 +86,8 @@ async def is_bar_alive(
     return False
 
 
-class Extension(Plugin):
+class Extension(Plugin, environments=[Environment.HYPRLAND, Environment.NIRI]):
     """Improves multi-monitor handling of the status bar and restarts it on crashes."""
-
-    environments = ["hyprland", "niri"]
 
     config_schema = ConfigItems(
         ConfigField(
@@ -96,40 +96,48 @@ class Extension(Plugin):
             default="uwsm app -- ashell",
             description="Command to run the bar (supports [monitor] variable)",
             required=True,
+            category="basic",
         ),
-        ConfigField("monitors", list, default=[], description="Preferred monitors list in order of priority"),
+        ConfigField("monitors", list, default=[], description="Preferred monitors list in order of priority", category="basic"),
     )
 
     monitors: set[str]
     proc: ManagedProcess | None = None
     cur_monitor: str | None = ""
+    _tasks: TaskManager
+    _consecutive_quick_crashes: int = 0
 
-    ongoing_task: asyncio.Task | None = None
+    def __init__(self, name: str) -> None:
+        """Initialize the plugin."""
+        super().__init__(name)
+        self._tasks = TaskManager()
 
-    async def on_reload(self) -> None:
+    async def on_reload(self, reason: ReloadReason = ReloadReason.RELOAD) -> None:
         """Start the process."""
+        _ = reason  # unused
         await self.stop()
+        self._consecutive_quick_crashes = 0
         self._run_program()
 
     def _run_program(self) -> None:
         """Create ongoing task restarting gbar in case of crash."""
-        if self.ongoing_task:
-            self.ongoing_task.cancel()
+        self._tasks.start()
 
         async def _run_loop() -> None:
             pid: int | bool = 0
-            while True:
+            while self._tasks.running:
                 if pid:
                     pid = await is_bar_alive(pid if isinstance(pid, int) else 0, self.backend, self.state.environment)
                     if pid:
-                        await asyncio.sleep(IDLE_LOOP_INTERVAL)
+                        if await self._tasks.sleep(IDLE_LOOP_INTERVAL):
+                            break
                         continue
 
                 await self.set_best_monitor()
                 command = self.get_config_str("command")
                 cmd = apply_variables(
                     command,
-                    {"monitor": self.cur_monitor if self.cur_monitor else ""},
+                    {"monitor": self.cur_monitor or ""},
                 )
                 start_time = time()
                 self.proc = ManagedProcess()
@@ -138,26 +146,43 @@ class Extension(Plugin):
                 await self.proc.wait()
 
                 now = time()
-
                 elapsed_time = now - start_time
-                delay = 0 if elapsed_time >= COOLDOWN_TIME else int((COOLDOWN_TIME - elapsed_time) / 2)
+
+                if elapsed_time >= CRASH_COOLDOWN:
+                    # Stable run (2+ min) - reset counter, restart immediately
+                    self._consecutive_quick_crashes = 0
+                    delay = 0
+                else:
+                    # Crash within 2 min - apply backoff
+                    self._consecutive_quick_crashes += 1
+                    if self._consecutive_quick_crashes == 1:
+                        delay = 0  # first crash: immediate
+                    else:
+                        # 2nd: 2s, 3rd: 4s, 4th: 8s, 5th: 16s, 6th: 32s, 7th+: 60s
+                        delay = min(BASE_DELAY * (2 ** (self._consecutive_quick_crashes - 2)), MAX_BACKOFF_DELAY)
+
                 text = f"Menu Bar crashed, restarting in {delay}s." if delay > 0 else "Menu Bar crashed, restarting immediately."
                 self.log.warning(text)
                 if delay:
                     await self.backend.notify_info(text)
-                await asyncio.sleep(delay or 0.1)
+                if await self._tasks.sleep(delay or 0.1):
+                    break
 
-        self.ongoing_task = asyncio.create_task(_run_loop())
+        self._tasks.create(_run_loop())
 
     def is_running(self) -> bool:
         """Check if the bar is currently running."""
-        return self.proc is not None and self.ongoing_task is not None
+        return self.proc is not None and self._tasks.running
 
     async def run_bar(self, args: str) -> None:
-        """<restart|stop|toggle> Start (default), restart, stop or toggle the menu bar.
+        """[restart|stop|toggle] Start (default), restart, stop or toggle the menu bar.
 
         Args:
-            args: The command arguments
+            args: The action to perform
+                - (empty): Start the bar
+                - restart: Stop and restart the bar
+                - stop: Stop the bar
+                - toggle: Toggle the bar on/off
         """
         if args.startswith("toggle"):
             if self.is_running():
@@ -184,7 +209,7 @@ class Extension(Plugin):
         """Get best monitor according to preferred list."""
         preferred_monitors = self.get_config_list("monitors")
 
-        if self.state.environment == "niri":
+        if self.state.environment == Environment.NIRI:
             # Niri: outputs is a dict, enabled outputs have current_mode set
             outputs = await self.backend.execute_json("outputs")
             names = [name for name, data in outputs.items() if data.get("current_mode") is not None]
@@ -246,11 +271,7 @@ class Extension(Plugin):
 
     async def stop(self) -> None:
         """Stop the process and supervision task."""
-        if self.ongoing_task:
-            self.ongoing_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self.ongoing_task
-            self.ongoing_task = None
+        await self._tasks.stop()
         if self.proc:
             await self.proc.stop()
             self.proc = None

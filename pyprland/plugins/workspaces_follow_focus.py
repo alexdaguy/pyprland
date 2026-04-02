@@ -1,24 +1,25 @@
 """Force workspaces to follow the focus / mouse."""
 
+import asyncio
 from typing import cast
 
+from ..models import Environment, ReloadReason
 from ..validation import ConfigField, ConfigItems
 from .interface import Plugin
 
 
-class Extension(Plugin):
+class Extension(Plugin, environments=[Environment.HYPRLAND]):
     """Makes non-visible workspaces available on the currently focused screen."""
 
-    environments = ["hyprland"]
-
     config_schema = ConfigItems(
-        ConfigField("max_workspaces", int, default=10, description="Maximum number of workspaces to manage"),
+        ConfigField("max_workspaces", int, default=10, description="Maximum number of workspaces to manage", category="basic"),
     )
 
     workspace_list: list[int]
 
-    async def on_reload(self) -> None:
+    async def on_reload(self, reason: ReloadReason = ReloadReason.RELOAD) -> None:
         """Rebuild workspaces list."""
+        _ = reason  # unused
         self.workspace_list = list(range(1, self.get_config_int("max_workspaces") + 1))
 
     async def event_focusedmon(self, screenid_name: str) -> None:
@@ -28,6 +29,7 @@ class Extension(Plugin):
             screenid_name: The screen ID and name
         """
         monitor_id, workspace_name = screenid_name.split(",")
+        await asyncio.sleep(0.1)
         # move every free workspace to the currently focused desktop
         busy_workspaces = {mon["activeWorkspace"]["name"] for mon in await self.backend.get_monitors() if mon["name"] != monitor_id}
         workspaces = [w["name"] for w in cast("list[dict]", await self.backend.execute_json("workspaces")) if w["id"] > 0]
@@ -37,21 +39,20 @@ class Extension(Plugin):
             if n in busy_workspaces or n == workspace_name:
                 continue
             batch.append(f"moveworkspacetomonitor name:{n} {monitor_id}")
-        await self.backend.execute(batch)
+        if batch:
+            await self.backend.execute(batch)
 
     async def run_change_workspace(self, direction: str) -> None:
-        """[direction] Switch workspaces of current monitor, avoiding displayed workspaces.
+        """<direction> Switch workspaces of current monitor, avoiding displayed workspaces.
 
         Args:
-            direction: The direction to switch
+            direction: Integer offset to move (e.g., +1 for next, -1 for previous)
         """
         increment = int(direction)
         # get focused screen info
         monitors = await self.backend.get_monitors()
-        try:
-            monitor = await self.backend.get_monitor_props()
-        except RuntimeError:
-            self.log.warning("Cannot find a focused monitor")
+        monitor = await self.get_focused_monitor_or_warn()
+        if monitor is None:
             return
         busy_workspaces = {m["activeWorkspace"]["id"] for m in monitors if m["id"] != monitor["id"]}
         cur_workspace = monitor["activeWorkspace"]["id"]

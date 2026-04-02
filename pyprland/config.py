@@ -1,8 +1,17 @@
-"""Configuration wrapper providing typed access and section filtering."""
+"""Configuration wrapper with typed accessors and schema-aware defaults.
+
+The Configuration class extends dict with:
+- Typed getters (get_bool, get_int, get_float, get_str)
+- Schema-based default values via set_schema()
+- Boolean coercion handling loose string values ("true", "yes", "1", etc.)
+
+Used by plugins to access their configuration sections with proper typing
+and automatic defaults from their config_schema definitions.
+"""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast, overload
 
 if TYPE_CHECKING:
     import logging
@@ -10,7 +19,7 @@ if TYPE_CHECKING:
 
     from .validation import ConfigItems
 
-__all__ = ["Configuration", "SchemaAwareMixin", "coerce_to_bool", "BOOL_TRUE_STRINGS", "BOOL_FALSE_STRINGS", "BOOL_STRINGS"]
+__all__ = ["BOOL_FALSE_STRINGS", "BOOL_STRINGS", "BOOL_TRUE_STRINGS", "Configuration", "SchemaAwareMixin", "coerce_to_bool"]
 
 # Type alias for config values
 ConfigValueType = float | bool | str | list | dict
@@ -61,6 +70,7 @@ class SchemaAwareMixin:
     """
 
     _schema_defaults: dict[str, ConfigValueType]
+    log: logging.Logger  # Required: implementing class must provide this
 
     def __init_schema__(self) -> None:
         """Initialize schema defaults storage. Call from subclass __init__."""
@@ -80,6 +90,15 @@ class SchemaAwareMixin:
         Override in subclasses to provide the actual lookup mechanism.
         """
         raise NotImplementedError
+
+    @overload
+    def get(self, name: str) -> ConfigValueType | None: ...
+
+    @overload
+    def get(self, name: str, default: None) -> ConfigValueType | None: ...
+
+    @overload
+    def get(self, name: str, default: ConfigValueType) -> ConfigValueType: ...
 
     def get(self, name: str, default: ConfigValueType | None = None) -> ConfigValueType | None:
         """Get a value with schema-aware defaults.
@@ -133,7 +152,7 @@ class SchemaAwareMixin:
         try:
             return int(value)  # type: ignore[arg-type]
         except (ValueError, TypeError):
-            self.log.warning("Invalid integer value for %s: %s", name, value)  # type: ignore[attr-defined]
+            self.log.warning("Invalid integer value for %s: %s", name, value)
             return default
 
     def get_float(self, name: str, default: float = 0.0) -> float:
@@ -152,7 +171,7 @@ class SchemaAwareMixin:
         try:
             return float(value)  # type: ignore[arg-type]
         except (ValueError, TypeError):
-            self.log.warning("Invalid float value for %s: %s", name, value)  # type: ignore[attr-defined]
+            self.log.warning("Invalid float value for %s: %s", name, value)
             return default
 
     def get_str(self, name: str, default: str = "") -> str:
@@ -194,10 +213,10 @@ class Configuration(SchemaAwareMixin, dict):
 
     def __init__(
         self,
-        *args: Any,  # noqa: ANN401
+        *args: Any,
         logger: logging.Logger,
         schema: ConfigItems | None = None,
-        **kwargs: Any,  # noqa: ANN401
+        **kwargs: Any,
     ):
         """Initialize the configuration object.
 
@@ -216,7 +235,7 @@ class Configuration(SchemaAwareMixin, dict):
     def _get_raw(self, name: str) -> ConfigValueType:
         """Get raw value from dict. Raises KeyError if not found."""
         if name in self:
-            return dict.get(self, name)  # type: ignore[return-value]
+            return cast("ConfigValueType", self[name])
         raise KeyError(name)
 
     def get(self, name: str, default: ConfigValueType | None = None) -> ConfigValueType | None:  # type: ignore[override]

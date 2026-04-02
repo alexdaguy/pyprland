@@ -3,18 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import time
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 from ...common import MINIMUM_ADDR_LEN
 from .common import HideFlavors
-from .helpers import get_match_fn
+from .helpers import get_match_fn, mk_scratch_name
 
 if TYPE_CHECKING:
     import logging
 
     from ...adapters.proxy import BackendProxy
+    from ...aioops import TaskManager
     from ...models import ClientInfo
     from . import Extension
     from .lookup import ScratchDB
@@ -35,7 +35,7 @@ class EventsMixin:
     log: logging.Logger
     backend: BackendProxy
     scratches: ScratchDB
-    _hysteresis_tasks: dict[str, asyncio.Task[Any]]
+    _tasks: TaskManager
     workspace: str
     previously_focused_window: str
     last_focused: Scratch | None
@@ -68,7 +68,7 @@ class EventsMixin:
         addr, _onoff = args.split(",")
         onoff = int(_onoff)
         for scratch in self.scratches.values():
-            if scratch.address == addr:
+            if scratch.address == addr and scratch.client_info is not None:
                 scratch.client_info["floating"] = bool(onoff)
 
     async def event_workspace(self, name: str) -> None:
@@ -95,20 +95,84 @@ class EventsMixin:
                 scratch.extra_addr.remove(addr)
             if addr in scratch.meta.extra_positions:
                 del scratch.meta.extra_positions[addr]
+            # Reset state when the primary window is closed
+            if scratch.full_address == addr:
+                scratch.visible = False
+                scratch.client_info = None
+                scratch.meta.initialized = False
 
     async def event_monitorremoved(self, monitor_name: str) -> None:
         """Hides scratchpads on the removed screen.
 
+        Uses a cancellable keyed task so that if the monitor is re-added
+        before the delay expires, the hide is cancelled (event_monitoradded
+        will handle cleanup instead).
+
         Args:
             monitor_name: The monitor name
         """
-        for scratch in self.scratches.values():
-            if scratch.monitor == monitor_name:
-                try:
-                    await self.run_hide(scratch.uid, flavor=HideFlavors.TRIGGERED_BY_AUTOHIDE)
-                except (RuntimeError, OSError, ConnectionError) as e:
-                    self.log.exception("Failed to hide %s", scratch.uid)
-                    await self.backend.notify_info(f"Failed to hide {scratch.uid}: {e}")
+
+        async def _delayed_hide(monitor: str) -> None:
+            await asyncio.sleep(1)
+            for scratch in self.scratches.values():
+                if scratch.monitor == monitor:
+                    try:
+                        await self.run_hide(scratch.uid, flavor=HideFlavors.TRIGGERED_BY_AUTOHIDE)
+                    except (RuntimeError, OSError, ConnectionError, KeyError) as e:
+                        self.log.exception("Failed to hide %s", scratch.uid)
+                        await self.backend.notify_info(f"Failed to hide {scratch.uid}: {e}")
+
+        self._tasks.create(_delayed_hide(monitor_name), key=f"monhide:{monitor_name}")
+
+    async def event_monitoradded(self, monitor_name: str) -> None:
+        """Re-hides scratchpads displaced from their special workspaces during monitor changes.
+
+        When a monitor is removed and re-added (e.g. display power cycle),
+        Hyprland may move scratchpad windows out of their special workspaces
+        and pin them onto regular workspaces. This handler cancels any pending
+        delayed hide from event_monitorremoved (which would race with the
+        re-addition), then checks all hidden scratchpads and moves any
+        displaced ones back to their special workspaces.
+
+        Args:
+            monitor_name: The monitor name
+        """
+        # Cancel any pending delayed hide for this monitor — it would race
+        # with the monitor re-addition and produce incorrect state.
+        if self.cancel_task(f"monhide:{monitor_name}"):
+            self.log.info("Cancelled pending monitor-hide for %s", monitor_name)
+
+        async def _fixup_displaced() -> None:
+            # Wait for Hyprland to finish all workspace migrations
+            # (FALLBACK removal, workspace recreation, etc.)
+            await asyncio.sleep(2)
+            clients = cast("list[dict]", await self.backend.execute_json("clients"))
+            for scratch in self.scratches.values():
+                if scratch.visible or scratch.client_info is None:
+                    continue
+                expected_workspace = mk_scratch_name(scratch.uid)
+                for client in clients:
+                    if client["address"] != scratch.full_address:
+                        continue
+                    actual_workspace = client["workspace"]["name"]
+                    if actual_workspace != expected_workspace:
+                        self.log.warning(
+                            "Scratchpad %s displaced from %s to %s after monitor change, re-hiding",
+                            scratch.uid,
+                            expected_workspace,
+                            actual_workspace,
+                        )
+                        # Unpin if Hyprland pinned it during the transition
+                        if client["pinned"]:
+                            await self.backend.pin_window(scratch.full_address)
+                        await self.backend.move_window_to_workspace(
+                            scratch.full_address,
+                            expected_workspace,
+                            silent=True,
+                        )
+                    break
+
+        self._tasks.create(_fixup_displaced(), key=f"monadd:{monitor_name}")
 
     async def event_activewindowv2(self, addr: str) -> None:
         """Active windows hook.
@@ -118,7 +182,7 @@ class EventsMixin:
         """
         full_address = "" if not addr or len(addr) < MINIMUM_ADDR_LEN else "0x" + addr
         for uid, scratch in self.scratches.items():
-            if len(scratch.client_info) == 0:
+            if scratch.client_info is None:
                 continue
             if scratch.have_address(full_address):
                 if scratch.full_address == full_address:
@@ -151,10 +215,7 @@ class EventsMixin:
                 self.log.debug("hide %s because another client is active", scratch.uid)
                 await self.run_hide(scratch.uid, flavor=HideFlavors.TRIGGERED_BY_AUTOHIDE)
 
-                with contextlib.suppress(KeyError):
-                    del self._hysteresis_tasks[scratch.uid]
-
-            self._hysteresis_tasks[scratch.uid] = asyncio.create_task(_task(scratch, hysteresis))
+            self._tasks.create(_task(scratch, hysteresis), key=scratch.uid)
         else:
             self.log.debug("hide %s because another client is active", scratch.uid)
             await self.run_hide(scratch.uid, flavor=HideFlavors.TRIGGERED_BY_AUTOHIDE)
@@ -170,7 +231,7 @@ class EventsMixin:
             match_by, match_value = pending_scratch.get_match_props()
             match_fn = get_match_fn(match_by, match_value)
             for client in clients:
-                if match_fn(client[match_by], match_value):  # type: ignore
+                if match_fn(client[match_by], match_value):  # type: ignore[literal-required]
                     self.scratches.register(pending_scratch, addr=client["address"][2:])
                     self.log.debug("client class found: %s", client)
                     await pending_scratch.update_client_info(client)

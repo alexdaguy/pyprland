@@ -3,19 +3,17 @@
 import asyncio
 from collections.abc import Iterable
 
-from ..models import VersionInfo
+from ..models import Environment, ReloadReason, VersionInfo
 from ..validation import ConfigField, ConfigItems
 from .interface import Plugin
 
 
-class Extension(Plugin):
+class Extension(Plugin, environments=[Environment.HYPRLAND]):
     """Toggles zooming of viewport or sets a specific scaling factor."""
 
-    environments = ["hyprland"]
-
     config_schema = ConfigItems(
-        ConfigField("factor", float, default=2.0, description="Zoom factor when toggling"),
-        ConfigField("duration", int, default=0, description="Animation duration in frames (0 to disable)"),
+        ConfigField("factor", float, default=2.0, description="Zoom factor when toggling", category="basic"),
+        ConfigField("duration", int, default=0, description="Animation duration in frames (0 to disable)", category="basic"),
     )
 
     zoomed = False
@@ -24,8 +22,9 @@ class Extension(Plugin):
 
     keyword = ""
 
-    async def on_reload(self) -> None:
+    async def on_reload(self, reason: ReloadReason = ReloadReason.RELOAD) -> None:
         """Initialization code."""
+        _ = reason  # unused
         if self.state.hyprland_version < VersionInfo(0, 40, 1):
             self.keyword = "misc:cursor_zoom_factor"
         else:

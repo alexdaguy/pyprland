@@ -1,6 +1,5 @@
 """Template processing for wallpapers plugin."""
 
-import asyncio
 import colorsys
 import contextlib
 import logging
@@ -8,6 +7,7 @@ import re
 from typing import cast
 
 from ...aioops import aiexists, aiopen
+from ...process import create_subprocess
 from .imageutils import expand_path
 from .models import HEX_LEN, HEX_LEN_HASH
 
@@ -78,7 +78,7 @@ async def _apply_filters(content: str, replacements: dict[str, str]) -> str:
 
         if filter_name and filter_arg:
             filter_arg = filter_arg.strip()
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(ValueError):
                 if filter_name == "set_alpha":
                     return _set_alpha(value, filter_arg)
                 if filter_name == "set_lightness":
@@ -94,7 +94,7 @@ async def _apply_filters(content: str, replacements: dict[str, str]) -> str:
 class TemplateEngine:
     """Handle template generation."""
 
-    def __init__(self, log: logging.Logger):
+    def __init__(self, log: logging.Logger) -> None:
         """Initialize the template engine.
 
         Args:
@@ -139,7 +139,7 @@ class TemplateEngine:
             post_hook = template_config.get("post_hook")
             if post_hook:
                 self.log.info("Running post_hook for %s: %s", name, post_hook)
-                await asyncio.create_subprocess_shell(post_hook)
+                await create_subprocess(post_hook)
 
         except OSError:
             self.log.exception("Error processing template %s", name)

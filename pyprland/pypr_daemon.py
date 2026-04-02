@@ -2,13 +2,14 @@
 
 import asyncio
 import itertools
+from pathlib import Path
 
 from pyprland.constants import CONTROL
 from pyprland.ipc import get_event_stream
 from pyprland.manager import Pyprland
 from pyprland.models import PyprError
 
-__all__ = ["run_daemon", "get_event_stream_with_retry"]
+__all__ = ["get_event_stream_with_retry", "run_daemon"]
 
 
 async def get_event_stream_with_retry(
@@ -35,7 +36,14 @@ async def get_event_stream_with_retry(
 async def run_daemon() -> None:
     """Run the server / daemon."""
     manager = Pyprland()
-    manager.server = await asyncio.start_unix_server(manager.read_command, CONTROL)
+
+    # Ensure IPC folder exists (needed when no environment is running)
+    ipc_folder = Path(CONTROL).parent
+    try:
+        ipc_folder.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        manager.log.critical("Cannot create IPC folder %s: %s", ipc_folder, e)
+        return
 
     result = await get_event_stream_with_retry()
     if result[0] is None:
@@ -46,6 +54,9 @@ async def run_daemon() -> None:
         manager.event_reader = events_reader
 
     await manager.initialize()
+
+    # Start server after initialization to avoid race conditions with plugin loading
+    manager.server = await asyncio.start_unix_server(manager.read_command, CONTROL)
 
     manager.log.debug("[ initialized ]".center(80, "="))
 

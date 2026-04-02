@@ -322,3 +322,267 @@ def test_config_validator_union_types(test_logger):
     errors = validator.validate(schema)
     assert len(errors) == 1
     assert "int or str" in errors[0]
+
+
+def test_config_validator_children_schema(test_logger):
+    """Test validation of dict fields with children schema."""
+    from pyprland.validation import ConfigItems
+
+    child_schema = ConfigItems(
+        ConfigField("scale", float),
+        ConfigField("enabled", bool),
+    )
+
+    schema = ConfigItems(
+        ConfigField("settings", dict, children=child_schema),
+    )
+
+    # Valid nested config
+    config = {"settings": {"item1": {"scale": 1.5, "enabled": True}}}
+    validator = ConfigValidator(config, "test", test_logger)
+    errors = validator.validate(schema)
+    assert len(errors) == 0
+
+
+def test_config_validator_children_type_errors(test_logger):
+    """Test children schema catches type errors."""
+    from pyprland.validation import ConfigItems
+
+    child_schema = ConfigItems(
+        ConfigField("scale", float),
+    )
+
+    schema = ConfigItems(
+        ConfigField("settings", dict, children=child_schema),
+    )
+
+    # Wrong type in nested config
+    config = {"settings": {"item1": {"scale": "not-a-float"}}}
+    validator = ConfigValidator(config, "test", test_logger)
+    errors = validator.validate(schema)
+    assert len(errors) == 1
+    assert "float" in errors[0]
+
+
+def test_config_validator_children_unknown_keys(test_logger):
+    """Test children schema warns about unknown keys."""
+    from pyprland.validation import ConfigItems
+
+    child_schema = ConfigItems(
+        ConfigField("scale", float),
+    )
+
+    schema = ConfigItems(
+        ConfigField("settings", dict, children=child_schema),
+    )
+
+    # Unknown key in nested config
+    config = {"settings": {"item1": {"scale": 1.5, "unknown_key": "value"}}}
+    validator = ConfigValidator(config, "test", test_logger)
+    errors = validator.validate(schema)
+    # Unknown keys show up as warnings/errors from children validation
+    assert any("unknown" in str(e).lower() for e in errors)
+
+
+def test_config_validator_children_collects_all_errors(test_logger):
+    """Test that all children errors are collected, not just first."""
+    from pyprland.validation import ConfigItems
+
+    child_schema = ConfigItems(
+        ConfigField("a", int),
+        ConfigField("b", int),
+    )
+
+    schema = ConfigItems(
+        ConfigField("settings", dict, children=child_schema),
+    )
+
+    # Multiple errors across multiple children
+    config = {
+        "settings": {
+            "item1": {"a": "wrong", "b": "wrong"},
+            "item2": {"a": "wrong"},
+        }
+    }
+    validator = ConfigValidator(config, "test", test_logger)
+    errors = validator.validate(schema)
+    # All errors are joined into a single string with newlines
+    # Check that all 3 error contexts are present
+    assert len(errors) == 1
+    error_text = errors[0]
+    assert "item1" in error_text
+    assert "item2" in error_text
+    assert error_text.count("Expected int") == 3
+
+
+def test_config_validator_children_non_dict_value(test_logger):
+    """Test children validation handles non-dict values gracefully."""
+    from pyprland.validation import ConfigItems
+
+    child_schema = ConfigItems(
+        ConfigField("scale", float),
+    )
+
+    schema = ConfigItems(
+        ConfigField("settings", dict, children=child_schema),
+    )
+
+    # Child value is not a dict
+    config = {"settings": {"item1": "not-a-dict"}}
+    validator = ConfigValidator(config, "test", test_logger)
+    errors = validator.validate(schema)
+    assert len(errors) == 1
+    assert "Expected dict" in errors[0]
+
+
+def test_config_validator_nested_children_schema(test_logger):
+    """Test validation of deeply nested children schemas (recursive)."""
+    from pyprland.validation import ConfigItems
+
+    # Grandchild schema
+    grandchild_schema = ConfigItems(
+        ConfigField("value", int),
+    )
+
+    # Child schema with its own children
+    child_schema = ConfigItems(
+        ConfigField("name", str),
+        ConfigField("nested", dict, children=grandchild_schema),
+    )
+
+    # Parent schema
+    schema = ConfigItems(
+        ConfigField("settings", dict, children=child_schema),
+    )
+
+    # Valid deeply nested config
+    config = {"settings": {"item1": {"name": "test", "nested": {"sub1": {"value": 42}}}}}
+    validator = ConfigValidator(config, "test", test_logger)
+    errors = validator.validate(schema)
+    assert len(errors) == 0
+
+    # Invalid type in grandchild
+    config_invalid = {"settings": {"item1": {"name": "test", "nested": {"sub1": {"value": "not-an-int"}}}}}
+    validator = ConfigValidator(config_invalid, "test", test_logger)
+    errors = validator.validate(schema)
+    assert len(errors) == 1
+    assert "int" in errors[0]
+    assert "sub1" in errors[0]  # Error path includes nested key
+
+
+# ---------------------------------------------------------------------------
+#  Scratchpad template detection helpers
+# ---------------------------------------------------------------------------
+
+from pyprland.plugins.scratchpads.schema import (
+    get_template_names,
+    is_pure_template,
+    validate_scratchpad_config,
+)
+
+
+def test_get_template_names_single_use():
+    config = {
+        "common": {"animation": "fromTop", "size": "80% 80%"},
+        "term": {"command": "kitty", "use": "common"},
+    }
+    assert get_template_names(config) == {"common"}
+
+
+def test_get_template_names_list_use():
+    config = {
+        "base": {"lazy": True},
+        "style": {"animation": "fromTop"},
+        "term": {"command": "kitty", "use": ["base", "style"]},
+    }
+    assert get_template_names(config) == {"base", "style"}
+
+
+def test_get_template_names_no_use():
+    config = {
+        "term": {"command": "kitty"},
+        "music": {"command": "spotify", "class": "spotify"},
+    }
+    assert get_template_names(config) == set()
+
+
+def test_get_template_names_skips_non_dict_and_dotted():
+    config = {
+        "common": {"animation": "fromTop"},
+        "term": {"command": "kitty", "use": "common"},
+        "term.monitor.DP-1": {"size": "50% 50%"},  # dotted key, should be skipped
+        "scalar_value": "not a dict",  # non-dict, should be skipped
+    }
+    assert get_template_names(config) == {"common"}
+
+
+def test_is_pure_template_true():
+    config = {
+        "common": {"animation": "fromTop"},
+        "term": {"command": "kitty", "use": "common"},
+    }
+    templates = get_template_names(config)
+    assert is_pure_template("common", config, templates) is True
+
+
+def test_is_pure_template_false_when_has_command():
+    """A section with a command is a real scratchpad even if referenced by use."""
+    config = {
+        "base_term": {"command": "kitty", "animation": "fromTop"},
+        "term": {"command": "kitty --class drop", "use": "base_term"},
+    }
+    templates = get_template_names(config)
+    assert is_pure_template("base_term", config, templates) is False
+
+
+def test_is_pure_template_false_when_not_referenced():
+    """A section without command that is NOT referenced by use is not a template."""
+    config = {
+        "orphan": {"animation": "fromTop"},
+        "term": {"command": "kitty"},
+    }
+    templates = get_template_names(config)
+    assert is_pure_template("orphan", config, templates) is False
+
+
+def test_is_pure_template_false_for_nonexistent():
+    config = {"term": {"command": "kitty"}}
+    assert is_pure_template("missing", config, set()) is False
+
+
+def test_validate_pure_template_no_errors():
+    """A pure template (no command, referenced via use) should validate without errors."""
+    config = {
+        "common": {"animation": "fromTop", "size": "80% 80%"},
+        "term": {"command": "kitty", "class": "kitty-drop", "use": "common"},
+    }
+    templates = get_template_names(config)
+
+    # Validate the template section -- should produce no errors
+    errors = validate_scratchpad_config("common", config["common"], is_template=is_pure_template("common", config, templates))
+    assert errors == []
+
+
+def test_validate_real_scratchpad_without_command_errors():
+    """A section without command that is NOT a template should still error."""
+    config = {
+        "orphan": {"animation": "fromTop"},
+        "term": {"command": "kitty"},
+    }
+    templates = get_template_names(config)
+
+    errors = validate_scratchpad_config("orphan", config["orphan"], is_template=is_pure_template("orphan", config, templates))
+    # Should require 'command' (missing required field)
+    assert any("command" in e.lower() or "required" in e.lower() for e in errors)
+
+
+def test_validate_static_with_templates():
+    """End-to-end: validate_config_static should not error on pure templates."""
+    from pyprland.plugins.scratchpads import Extension
+
+    config = {
+        "common": {"animation": "fromTop", "size": "80% 80%", "margin": 50},
+        "term": {"command": "kitty --class kitty-drop", "class": "kitty-drop", "use": "common"},
+    }
+    errors = Extension.validate_config_static("scratchpads", config)
+    assert errors == []

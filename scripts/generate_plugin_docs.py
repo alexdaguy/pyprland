@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """Generate JSON documentation for pyprland plugins.
 
 This script extracts documentation from plugin source code:
@@ -14,8 +14,8 @@ from __future__ import annotations
 import importlib
 import inspect
 import json
-import re
 import sys
+import tomllib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,16 +24,17 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from pyprland.commands.discovery import extract_commands_from_object, get_client_commands
+from pyprland.commands.models import CommandArg
+from pyprland.commands.tree import get_display_name, get_parent_prefixes
+
 # Paths
 PLUGINS_DIR = PROJECT_ROOT / "pyprland" / "plugins"
 OUTPUT_DIR = PROJECT_ROOT / "site" / "generated"
-METADATA_FILE = PROJECT_ROOT / "scripts" / "plugin_metadata.json"
+METADATA_FILE = PROJECT_ROOT / "scripts" / "plugin_metadata.toml"
 
 # Plugins to skip (not real plugins)
-SKIP_PLUGINS = {"interface", "protocols", "__init__", "experimental"}
-
-# Plugins that are packages (directories with __init__.py)
-PACKAGE_PLUGINS = {"scratchpads", "monitors", "wallpapers", "pyprland"}
+SKIP_PLUGINS = {"interface", "protocols", "__init__", "experimental", "mixins"}
 
 
 @dataclass
@@ -47,6 +48,9 @@ class ConfigItem:
     default: Any = None
     description: str = ""
     choices: list[str] | None = None
+    children: list["ConfigItem"] | None = None
+    category: str = ""
+    is_directory: bool = False  # For Path types: True = directory, False = file
 
 
 @dataclass
@@ -54,7 +58,7 @@ class CommandItem:
     """A command extracted from a plugin."""
 
     name: str
-    signature: str
+    args: list[CommandArg]  # Structured args for rendering
     short_description: str
     full_description: str
 
@@ -86,6 +90,11 @@ def extract_config_from_schema(schema: list) -> list[ConfigItem]:
         if default is not None and not isinstance(default, (str, int, float, bool, list, dict)):
             default = str(default)
 
+        # Extract children if present
+        children_items = None
+        if getattr(field_def, "children", None):
+            children_items = extract_config_from_schema(field_def.children)
+
         config_items.append(
             ConfigItem(
                 name=field_def.name,
@@ -95,55 +104,12 @@ def extract_config_from_schema(schema: list) -> list[ConfigItem]:
                 default=default,
                 description=field_def.description,
                 choices=field_def.choices,
+                children=children_items,
+                category=getattr(field_def, "category", ""),
+                is_directory=getattr(field_def, "is_directory", False),
             )
         )
     return config_items
-
-
-def parse_command_docstring(docstring: str, method_name: str) -> tuple[str, str, str]:
-    """Parse a command method's docstring to extract signature, short and full descriptions.
-
-    The first line of the docstring often contains the signature like:
-    "<arg> Short description" or "[optional_arg] Short description"
-
-    Args:
-        docstring: The raw docstring
-        method_name: The method name (without run_ prefix)
-
-    Returns:
-        Tuple of (signature, short_description, full_description)
-    """
-    if not docstring:
-        return method_name, "No description available.", ""
-
-    lines = docstring.strip().split("\n")
-    first_line = lines[0].strip()
-
-    # Check if first line starts with argument spec like <arg>, [arg], or is just description
-    # Pattern: optional leading args in <> or [], then the description
-    arg_pattern = r"^((?:\[[\w\s\-]+\]|\<[\w\s\-]+\>)\s*)*(.*)$"
-    match = re.match(arg_pattern, first_line)
-
-    if match:
-        args_part = match.group(1) or ""
-        desc_part = match.group(2) or first_line
-
-        # Build signature from method name and extracted args
-        args_part = args_part.strip()
-        if args_part:
-            signature = f"{method_name} {args_part}"
-        else:
-            signature = method_name
-
-        short_description = desc_part.strip() if desc_part.strip() else first_line
-    else:
-        signature = method_name
-        short_description = first_line
-
-    # Full description is the entire docstring
-    full_description = docstring.strip()
-
-    return signature, short_description, full_description
 
 
 def extract_commands(extension_class: type) -> list[CommandItem]:
@@ -156,29 +122,15 @@ def extract_commands(extension_class: type) -> list[CommandItem]:
         List of CommandItem dataclasses
     """
     commands = []
-
-    for name in dir(extension_class):
-        if not name.startswith("run_"):
-            continue
-
-        method = getattr(extension_class, name)
-        if not callable(method):
-            continue
-
-        command_name = name[4:]  # Remove 'run_' prefix
-        docstring = inspect.getdoc(method) or ""
-
-        signature, short_desc, full_desc = parse_command_docstring(docstring, command_name)
-
+    for cmd_info in extract_commands_from_object(extension_class, source=""):
         commands.append(
             CommandItem(
-                name=command_name,
-                signature=signature,
-                short_description=short_desc,
-                full_description=full_desc,
+                name=cmd_info.name,
+                args=cmd_info.args,
+                short_description=cmd_info.short_description,
+                full_description=cmd_info.full_description,
             )
         )
-
     return commands
 
 
@@ -268,6 +220,18 @@ def load_plugin(plugin_name: str) -> PluginDoc | None:
     # Extract commands
     commands = extract_commands(extension_class)
 
+    # For pyprland plugin, also include client-only commands (edit, validate)
+    if plugin_name == "pyprland":
+        for cmd_info in get_client_commands():
+            commands.append(
+                CommandItem(
+                    name=cmd_info.name,
+                    args=cmd_info.args,
+                    short_description=cmd_info.short_description,
+                    full_description=cmd_info.full_description,
+                )
+            )
+
     # Extract configuration schema
     config_items = []
 
@@ -300,6 +264,8 @@ def load_plugin(plugin_name: str) -> PluginDoc | None:
                 default=field_def.default,
                 description=field_def.description,
                 choices=field_def.choices,
+                category=getattr(field_def, "category", ""),
+                is_directory=getattr(field_def, "is_directory", False),
             )
             config_items.append(item)
 
@@ -315,8 +281,8 @@ def load_plugin(plugin_name: str) -> PluginDoc | None:
 def load_metadata() -> dict[str, dict]:
     """Load the editorial metadata file."""
     if METADATA_FILE.exists():
-        with open(METADATA_FILE) as f:
-            return json.load(f)
+        with open(METADATA_FILE, mode="rb") as f:
+            return tomllib.load(f)
     return {}
 
 
@@ -352,28 +318,6 @@ def generate_menu_json() -> dict:
         "config": [asdict(cfg) for cfg in config_items],
         "engine_defaults": engine_defaults,
     }
-
-
-def generate_builtins_json() -> dict:
-    """Generate JSON for built-in commands from builtin_commands.py.
-
-    Returns:
-        Dict ready for JSON serialization
-    """
-    from pyprland.builtin_commands import BUILTIN_COMMANDS
-
-    commands = []
-    for name, (short_desc, detail, subcommands) in BUILTIN_COMMANDS.items():
-        commands.append(
-            {
-                "name": name,
-                "short_description": short_desc,
-                "detail": detail,
-                "subcommands": subcommands,
-            }
-        )
-
-    return {"commands": commands}
 
 
 def generate_index_json(plugin_docs: list[PluginDoc], metadata: dict) -> dict:
@@ -421,7 +365,7 @@ def main():
     metadata = load_metadata()
     print(f"Loaded metadata for {len(metadata)} plugins")
 
-    # Process each plugin
+    # Process each plugin (collect docs first, don't write yet)
     plugin_docs = []
     for plugin_name in plugin_names:
         print(f"Processing {plugin_name}...")
@@ -429,12 +373,25 @@ def main():
         if doc:
             plugin_docs.append(doc)
 
-            # Write individual plugin JSON
-            output_file = OUTPUT_DIR / f"{plugin_name}.json"
-            with open(output_file, "w") as f:
-                json.dump(generate_plugin_json(doc), f, indent=2)
-                f.write("\n")
-            print(f"  -> {output_file.relative_to(PROJECT_ROOT)}")
+    # Compute parent prefixes from ALL commands across ALL plugins
+    # Only group commands from the SAME plugin (source) into hierarchies
+    # e.g., wall_rm -> "wall rm" (same plugin as wall_next, wall_pause)
+    # but toggle_special stays as-is (different plugin than toggle_dpms)
+    all_commands_with_source = {cmd.name: doc.name for doc in plugin_docs for cmd in doc.commands}
+    parent_prefixes = get_parent_prefixes(all_commands_with_source)
+
+    # Transform command names to display format
+    for doc in plugin_docs:
+        for cmd in doc.commands:
+            cmd.name = get_display_name(cmd.name, parent_prefixes)
+
+    # Write individual plugin JSON files
+    for doc in plugin_docs:
+        output_file = OUTPUT_DIR / f"{doc.name}.json"
+        with open(output_file, "w") as f:
+            json.dump(generate_plugin_json(doc), f, indent=2)
+            f.write("\n")
+        print(f"  -> {output_file.relative_to(PROJECT_ROOT)}")
 
     # Generate index.json
     index_file = OUTPUT_DIR / "index.json"
@@ -449,13 +406,6 @@ def main():
         json.dump(generate_menu_json(), f, indent=2)
         f.write("\n")
     print(f"Generated menu capability: {menu_file.relative_to(PROJECT_ROOT)}")
-
-    # Generate builtins.json for built-in commands
-    builtins_file = OUTPUT_DIR / "builtins.json"
-    with open(builtins_file, "w") as f:
-        json.dump(generate_builtins_json(), f, indent=2)
-        f.write("\n")
-    print(f"Generated builtins: {builtins_file.relative_to(PROJECT_ROOT)}")
 
     print(f"\nDone! Generated documentation for {len(plugin_docs)} plugins.")
 

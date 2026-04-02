@@ -1,23 +1,22 @@
 """expose Brings every client window to screen for selection."""
 
-from ..models import ClientInfo
+from ..models import ClientInfo, Environment, ReloadReason
 from ..validation import ConfigField, ConfigItems
 from .interface import Plugin
 
 
-class Extension(Plugin):
+class Extension(Plugin, environments=[Environment.HYPRLAND]):
     """Exposes all windows for a quick 'jump to' feature."""
 
-    environments = ["hyprland"]
-
     config_schema = ConfigItems(
-        ConfigField("include_special", bool, default=False, description="Include windows from special workspaces"),
+        ConfigField("include_special", bool, default=False, description="Include windows from special workspaces", category="basic"),
     )
 
     exposed: list[ClientInfo]
 
-    async def on_reload(self) -> None:
+    async def on_reload(self, reason: ReloadReason = ReloadReason.RELOAD) -> None:
         """Initialize exposed list on reload."""
+        _ = reason  # unused
         self.exposed = []
 
     @property

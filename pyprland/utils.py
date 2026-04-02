@@ -1,11 +1,19 @@
-"""General utility functions."""
+"""General utility functions for Pyprland.
 
-import asyncio
+Provides:
+- merge(): Deep dict merging with optional replace mode
+- apply_variables(): Template variable substitution [var_name] -> value
+- apply_filter(): Text filtering with vim-like s/find/replace/ syntax
+- is_rotated(): Check if monitor has 90/270 degree rotation
+- notify_send(): Send desktop notifications via notify-send
+"""
+
 import contextlib
 import re
 from typing import Any
 
 from .models import MonitorInfo
+from .process import create_subprocess
 
 __all__ = [
     "apply_filter",
@@ -131,4 +139,4 @@ async def notify_send(text: str, duration: int = 3000, color: str | None = None,
 
     with contextlib.suppress(FileNotFoundError):
         # We don't care about the output
-        await asyncio.create_subprocess_exec(*args)
+        await create_subprocess(*args, shell=False)

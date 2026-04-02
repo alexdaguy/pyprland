@@ -3,22 +3,59 @@
 import asyncio
 import colorsys
 import contextlib
+import json
 import random
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
+from ...aioops import TaskManager, aiexists, aiisfile, airmdir, airmtree, aiunlink
 from ...common import apply_variables
-from ...process import ManagedProcess
+from ...constants import (
+    DEFAULT_PALETTE_COLOR_RGB,
+    DEFAULT_WALLPAPER_HEIGHT,
+    DEFAULT_WALLPAPER_WIDTH,
+    PREFETCH_MAX_RETRIES,
+    PREFETCH_RETRY_BASE_SECONDS,
+    PREFETCH_RETRY_MAX_SECONDS,
+    SECONDS_PER_DAY,
+)
+from ...models import Environment, ReloadReason
+from ...process import ManagedProcess, create_subprocess
 from ...validation import ConfigField, ConfigItems
 from ..interface import Plugin
+from .cache import ImageCache
 from .colorutils import can_edit_image, get_dominant_colors, nicify_oklab
+from .hyprpaper import HyprpaperManager
 from .imageutils import (
     MonitorInfo,
     RoundedImageManager,
     expand_path,
+    get_effective_dimensions,
     get_files_with_ext,
 )
+from .models import ColorScheme
+from .online import NoBackendAvailableError, OnlineFetcher
+from .palette import generate_sample_palette, hex_to_rgb, palette_to_json, palette_to_terminal
 from .templates import TemplateEngine
 from .theme import detect_theme, generate_palette, get_color_scheme_props
+
+# Length of a hex color without '#' prefix
+HEX_COLOR_LENGTH = 6
+
+# Default backends that support size filtering (excludes bing which returns fixed 1920x1080)
+DEFAULT_ONLINE_BACKENDS = ["unsplash", "picsum", "wallhaven", "reddit"]
+
+
+@dataclass
+class OnlineState:
+    """State for online wallpaper fetching."""
+
+    fetcher: OnlineFetcher | None = None
+    folder_path: Path | None = None
+    cache: ImageCache | None = None
+    rounded_cache: ImageCache | None = None
+    prefetched_path: str | None = None
 
 
 async def fetch_monitors(extension: "Extension") -> list[MonitorInfo]:
@@ -43,40 +80,89 @@ class Extension(Plugin):
     """Handles random wallpapers at regular intervals, with support for rounded corners and color scheme generation."""
 
     config_schema = ConfigItems(
-        ConfigField("path", (str, list), required=True, description="Path(s) to wallpaper images or directories"),
-        ConfigField("interval", int, default=10, description="Minutes between wallpaper changes"),
-        ConfigField("extensions", list, description="File extensions to include (e.g., ['png', 'jpg'])", default=["png", "jpeg", "jpg"]),
-        ConfigField("recurse", bool, default=False, description="Recursively search subdirectories"),
-        ConfigField("unique", bool, default=False, description="Use different wallpaper per monitor"),
-        ConfigField("radius", int, default=0, description="Corner radius for rounded corners"),
-        ConfigField("command", str, description="Custom command to set wallpaper ([file] and [output] variables)"),
-        ConfigField("post_command", str, description="Command to run after setting wallpaper"),
-        ConfigField("clear_command", str, description="Command to run when clearing wallpaper"),
+        ConfigField("path", (Path, list), required=True, description="Path(s) to wallpaper images or directories", category="basic"),
+        ConfigField("interval", int, default=10, description="Minutes between wallpaper changes", category="basic"),
+        ConfigField(
+            "extensions",
+            list,
+            description="File extensions to include (e.g., ['png', 'jpg'])",
+            default=["png", "jpeg", "jpg"],
+            category="basic",
+        ),
+        ConfigField("recurse", bool, default=False, description="Recursively search subdirectories", category="basic"),
+        ConfigField("unique", bool, default=False, description="Use different wallpaper per monitor", category="basic"),
+        ConfigField("radius", int, default=0, description="Corner radius for rounded corners", category="appearance"),
+        ConfigField(
+            "command", str, description="Custom command to set wallpaper ([file] and [output] variables)", category="external_commands"
+        ),
+        ConfigField("post_command", str, description="Command to run after setting wallpaper", category="external_commands"),
+        ConfigField("clear_command", str, description="Command to run when clearing wallpaper", category="external_commands"),
         ConfigField(
             "color_scheme",
             str,
             default="",
             description="Color scheme for palette generation",
-            choices=["", "pastel", "fluo", "fluorescent", "vibrant", "mellow", "neutral", "earth"],
+            choices=[c.value for c in ColorScheme] + ["fluorescent"],
+            category="templating",
         ),
-        ConfigField("variant", str, description="Color variant type for palette"),
-        ConfigField("templates", dict, description="Template files for color palette generation"),
+        ConfigField("variant", str, description="Color variant type for palette", category="templating"),
+        ConfigField("templates", dict, description="Template files for color palette generation", category="templating"),
+        # Online wallpaper fetching options
+        ConfigField("online_ratio", float, default=0.0, description="Probability of fetching online (0.0-1.0)", category="online"),
+        ConfigField(
+            "online_backends",
+            list,
+            default=DEFAULT_ONLINE_BACKENDS,
+            description="Enabled online backends",
+            category="online",
+        ),
+        ConfigField("online_keywords", list, default=[], description="Keywords to filter online images", category="online"),
+        ConfigField("online_folder", str, default="online", description="Subfolder for downloaded online images", category="online"),
+        # Cache options
+        ConfigField("cache_days", int, default=0, description="Days to keep cached images (0 = forever)", category="cache"),
+        ConfigField("cache_max_mb", int, default=100, description="Maximum cache size in MB (0 = unlimited)", category="cache"),
+        ConfigField("cache_max_images", int, default=0, description="Maximum number of cached images (0 = unlimited)", category="cache"),
     )
 
     image_list: list[str]
-    running = True
+    _tasks: TaskManager
+    _loop_started = False
     proc: list[ManagedProcess]
-    loop = None
 
     next_background_event = asyncio.Event()
     cur_image = ""
+    cur_display_image = ""  # The actual path sent to hyprpaper (may be rounded)
     _paused = False
 
     rounded_manager: RoundedImageManager | None
     template_engine: TemplateEngine
 
-    async def on_reload(self) -> None:
+    # Online fetching state
+    _online: OnlineState | None = None
+    _online_folders: set[str]
+
+    # Hyprpaper manager (only when using hyprpaper backend)
+    _hyprpaper: HyprpaperManager | None = None
+
+    def __init__(self, name: str) -> None:
+        """Initialize the plugin."""
+        super().__init__(name)
+        self._tasks = TaskManager()
+        self._online_folders = set()
+
+    async def on_reload(self, reason: ReloadReason = ReloadReason.RELOAD) -> None:
         """Re-build the image list."""
+        _ = reason  # unused
+        # Clean up legacy cache folder if it exists
+        legacy_cache = Path.home() / ".cache" / "pyprland" / "wallpapers"
+        if await aiexists(legacy_cache):
+            await airmtree(str(legacy_cache))
+            self.log.info("Removed legacy cache folder: %s", legacy_cache)
+            # Also remove parent if empty
+            parent = legacy_cache.parent
+            if await aiexists(parent) and not any(parent.iterdir()):
+                await airmdir(str(parent))
+
         self.image_list = []
         # Require 'command' when not on Hyprland (hyprpaper default only works there)
         if not self.get_config("command") and self.state.environment != "hyprland":
@@ -86,32 +172,182 @@ class Extension(Plugin):
             )
             return
 
+        # Initialize hyprpaper manager if using default hyprpaper backend
+        if self.state.environment == Environment.HYPRLAND and not self.get_config("command"):
+            self._hyprpaper = HyprpaperManager(self.log)
+        else:
+            self._hyprpaper = None
+
         cfg_path: str | list[str] = self.get_config("path")  # type: ignore[assignment]
         paths = [expand_path(cfg_path)] if isinstance(cfg_path, str) else [expand_path(p) for p in cfg_path]
         extensions = self.get_config_list("extensions")
         radius = self.get_config_int("radius")
+        online_ratio = self.get_config_float("online_ratio")
 
+        # Build set of online folder paths (for wall rm command)
+        online_folder_name = self.get_config_str("online_folder") or "online"
+        self._online_folders = {str(Path(p) / online_folder_name) for p in paths}
+
+        # Build local image list, excluding cache folders (rounded, online)
+        exclude_dirs = {"rounded", online_folder_name}
         self.image_list = [
-            full_path for path in paths async for full_path in get_files_with_ext(path, extensions, recurse=self.get_config_bool("recurse"))
+            full_path
+            for path in paths
+            async for full_path in get_files_with_ext(path, extensions, recurse=self.get_config_bool("recurse"), exclude_dirs=exclude_dirs)
         ]
 
+        # Set up online fetching and get rounded cache
+        self._online = await self._setup_online_fetching(paths, extensions, online_ratio)
+
+        # Warn if no local images but online_ratio < 1
+        if not self.image_list and online_ratio < 1.0:
+            await self._warn_no_images()
+
+        # Set up rounded corners manager with appropriate cache location
+        rounded_cache = self._online.rounded_cache if self._online else None
         if radius > 0 and can_edit_image:
-            self.rounded_manager = RoundedImageManager(radius)
+            if not rounded_cache:
+                # Create local rounded cache when online is disabled
+                first_path = paths[0] if paths else expand_path("~/Pictures/Wallpapers")
+                rounded_cache_dir = Path(first_path) / "rounded"
+                rounded_cache_dir.mkdir(parents=True, exist_ok=True)
+                rounded_cache = self._create_cache(rounded_cache_dir)
+            self.rounded_manager = RoundedImageManager(radius, cache=rounded_cache)
         else:
             self.rounded_manager = None
 
         self.template_engine = TemplateEngine(self.log)
 
+        # Clean up expired cache entries asynchronously
+        await self._cleanup_caches()
+
         # Start the main loop if it's the first load of the config
-        if self.loop is None:
-            self.loop = asyncio.create_task(self.main_loop())
+        if not self._loop_started:
+            self._tasks.start()
+            self._tasks.create(self.main_loop())
+            self._loop_started = True
+
+    def _create_cache(self, cache_dir: Path) -> ImageCache:
+        """Create an ImageCache with the configured TTL and size limits."""
+        cache_days = self.get_config_int("cache_days")
+        cache_max_mb = self.get_config_int("cache_max_mb")
+        return ImageCache(
+            cache_dir=cache_dir,
+            ttl=cache_days * SECONDS_PER_DAY if cache_days else None,
+            max_size=cache_max_mb * 1024 * 1024 if cache_max_mb else None,
+            max_count=self.get_config_int("cache_max_images") or None,
+        )
+
+    async def _setup_online_fetching(
+        self,
+        paths: list[str],
+        extensions: list[str],
+        online_ratio: float,
+    ) -> OnlineState | None:
+        """Set up online fetching if enabled.
+
+        Args:
+            paths: List of wallpaper paths.
+            extensions: List of file extensions.
+            online_ratio: Probability of fetching online.
+
+        Returns:
+            OnlineState with fetcher and caches, or None if online disabled.
+        """
+        # Close existing fetcher if any
+        if self._online and self._online.fetcher:
+            await self._online.fetcher.close()
+
+        if online_ratio <= 0:
+            return None
+
+        # Set up online folder
+        first_path = paths[0] if paths else expand_path("~/Pictures/Wallpapers")
+        online_folder_name = self.get_config_str("online_folder") or "online"
+        folder_path = Path(first_path) / online_folder_name
+        folder_path.mkdir(parents=True, exist_ok=True)
+        self.log.debug("Online cache folder: %s", folder_path)
+
+        # Create online cache
+        online_cache = self._create_cache(folder_path)
+
+        # Create rounded cache subfolder and cache
+        rounded_cache_dir = folder_path / "rounded"
+        rounded_cache_dir.mkdir(parents=True, exist_ok=True)
+        rounded_cache = self._create_cache(rounded_cache_dir)
+
+        # Initialize OnlineFetcher with the online cache
+        backends = self.get_config_list("online_backends")
+        fetcher: OnlineFetcher | None = None
+        try:
+            fetcher = OnlineFetcher(
+                backends=backends or None,
+                cache=online_cache,
+                log=self.log,
+            )
+            self.log.info("Online fetching enabled with backends: %s", fetcher.backends)
+        except ValueError:
+            self.log.exception("Failed to initialize online fetcher")
+
+        # Always scan online folder for existing images (regardless of recurse setting)
+        async for full_path in get_files_with_ext(str(folder_path), extensions, recurse=False):
+            if full_path not in self.image_list:
+                self.image_list.append(full_path)
+
+        return OnlineState(
+            fetcher=fetcher,
+            folder_path=folder_path,
+            cache=online_cache,
+            rounded_cache=rounded_cache,
+        )
+
+    async def _cleanup_caches(self) -> None:
+        """Clean up expired cache entries asynchronously."""
+        cache_days = self.get_config_int("cache_days")
+        if not cache_days or not self._online:
+            return  # No TTL configured or online disabled, skip cleanup
+
+        cleanup_tasks = []
+        if self._online.cache:
+            cleanup_tasks.append(asyncio.to_thread(self._online.cache.cleanup))
+        if self._online.rounded_cache:
+            cleanup_tasks.append(asyncio.to_thread(self._online.rounded_cache.cleanup))
+
+        if cleanup_tasks:
+            results = await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+            total_removed = sum(r for r in results if isinstance(r, int))
+            if total_removed > 0:
+                self.log.info("Cache cleanup: removed %d expired files", total_removed)
+
+    def _get_local_paths(self) -> list[Path]:
+        """Get configured local wallpaper paths.
+
+        Returns:
+            List of Path objects for configured wallpaper directories.
+        """
+        cfg_path: str | list[str] = self.get_config("path")  # type: ignore[assignment]
+        if isinstance(cfg_path, str):
+            return [Path(expand_path(cfg_path))]
+        return [Path(expand_path(p)) for p in cfg_path]
+
+    async def _warn_no_images(self) -> None:
+        """Warn user when no local images are available."""
+        if self._online and self._online.fetcher:
+            self.log.warning("No local images found, will use online-only mode")
+            await self.backend.notify_info("No local wallpapers found, using online only")
+        else:
+            self.log.error("No images available: no local images and online fetching disabled")
+            await self.backend.notify_error("No wallpapers available")
 
     async def exit(self) -> None:
         """Terminates gracefully."""
-        self.running = False
-        if self.loop:
-            self.loop.cancel()
+        await self._tasks.stop()
+        self._loop_started = False
         await self.terminate()
+
+        # Close online fetcher session
+        if self._online and self._online.fetcher:
+            await self._online.fetcher.close()
 
     async def event_monitoradded(self, _: str) -> None:
         """When a new monitor is added, set the background."""
@@ -121,13 +357,336 @@ class Extension(Plugin):
         """When the monitor configuration changes (Niri), set the background."""
         self.next_background_event.set()
 
-    def select_next_image(self) -> str:
-        """Return the next image (random is supported for now)."""
-        choice = random.choice(self.image_list)
-        if choice == self.cur_image:
+    async def select_next_image(self) -> str:
+        """Return the next image - randomly selects online or local based on ratio."""
+        online_ratio = self.get_config_float("online_ratio")
+        use_online = random.random() < online_ratio
+        has_online_fetcher = self._online is not None and self._online.fetcher is not None
+
+        # Fallback logic
+        if use_online and not has_online_fetcher:
+            use_online = False
+        if not use_online and not self.image_list:
+            if has_online_fetcher:
+                use_online = True
+            else:
+                self.log.error("No images available (local or online)")
+                return self.cur_image  # Return current or empty
+
+        if use_online:
+            choice = await self._fetch_online_image()
+        else:
             choice = random.choice(self.image_list)
+            if choice == self.cur_image and len(self.image_list) > 1:
+                choice = random.choice(self.image_list)
+
         self.cur_image = choice
+        self.log.debug("Selected image: %s (online=%s)", choice, use_online)
         return choice
+
+    async def _fetch_online_image(self) -> str:
+        """Fetch a new image from online backends.
+
+        Uses prefetched image if available, otherwise fetches synchronously.
+
+        Returns:
+            Path to the downloaded image.
+
+        Raises:
+            NoBackendAvailableError: If all backends fail and no local fallback.
+        """
+        # Use prefetched image if available
+        if self._online and self._online.prefetched_path:
+            path = self._online.prefetched_path
+            self._online.prefetched_path = None
+            if await aiexists(path):
+                self.log.debug("Using prefetched image: %s", path)
+                return path
+            self.log.debug("Prefetched image no longer exists, fetching new")
+
+        if not self._online or not self._online.fetcher:
+            msg = "Online fetcher not initialized"
+            raise RuntimeError(msg)
+
+        fetcher = self._online.fetcher
+
+        # Get monitor dimensions for size hint (accounting for rotation)
+        monitors = await fetch_monitors(self)
+        dimensions = [get_effective_dimensions(m) for m in monitors]
+        max_width = max((w for w, _ in dimensions), default=DEFAULT_WALLPAPER_WIDTH)
+        max_height = max((h for _, h in dimensions), default=DEFAULT_WALLPAPER_HEIGHT)
+
+        keywords = self.get_config_list("online_keywords") or None
+
+        try:
+            path = str(
+                await fetcher.get_image(
+                    min_width=max_width,
+                    min_height=max_height,
+                    keywords=keywords,
+                )
+            )
+        except NoBackendAvailableError:
+            self.log.exception("Failed to fetch online image")
+            await self.backend.notify_error("Online wallpaper fetch failed")
+
+            # Fallback to local if available
+            if self.image_list:
+                return random.choice(self.image_list)
+            raise
+
+        # Add to local pool for future selection
+        if path not in self.image_list:
+            self.image_list.append(path)
+
+        return path
+
+    async def _prefetch_online_image(self) -> None:
+        """Prefetch next online image in background with exponential backoff retry."""
+        if not self._online or not self._online.fetcher:
+            return
+
+        # Get monitor dimensions for size hint (accounting for rotation)
+        monitors = await fetch_monitors(self)
+        dimensions = [get_effective_dimensions(m) for m in monitors]
+        max_width = max((w for w, _ in dimensions), default=DEFAULT_WALLPAPER_WIDTH)
+        max_height = max((h for _, h in dimensions), default=DEFAULT_WALLPAPER_HEIGHT)
+        keywords = self.get_config_list("online_keywords") or None
+
+        for attempt in range(PREFETCH_MAX_RETRIES):
+            try:
+                path = await self._online.fetcher.get_image(min_width=max_width, min_height=max_height, keywords=keywords)
+                self._online.prefetched_path = str(path)
+                if str(path) not in self.image_list:
+                    self.image_list.append(str(path))
+                self.log.debug("Prefetched: %s", path)
+            except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+                # Catch all errors (network, parsing, etc.) to retry with different backend
+                if attempt < PREFETCH_MAX_RETRIES - 1:
+                    delay = min(PREFETCH_RETRY_BASE_SECONDS * (2**attempt), PREFETCH_RETRY_MAX_SECONDS)
+                    self.log.debug("Prefetch attempt %d failed, retry in %ds", attempt + 1, delay)
+                    await asyncio.sleep(delay)
+            else:
+                return
+
+        self.log.warning("Prefetch failed after %d retries", PREFETCH_MAX_RETRIES)
+
+    async def run_wall_rm(self) -> None:
+        """Remove the current online wallpaper and show next.
+
+        Only removes online wallpapers (files in the online folder).
+        Shows an error notification for local wallpapers.
+        """
+        if not self.cur_image:
+            self.log.warning("No current wallpaper to remove")
+            return
+
+        cur_path = Path(self.cur_image)
+        online_folder = cur_path.parent
+
+        # Handle images in "rounded" subfolder
+        if online_folder.name == "rounded":
+            online_folder = online_folder.parent
+
+        # Check if image is in an online folder
+        if str(online_folder) not in self._online_folders:
+            await self.backend.notify_error("Cannot remove local wallpapers")
+            return
+
+        # Remove from image_list
+        if self.cur_image in self.image_list:
+            self.image_list.remove(self.cur_image)
+
+        # Delete the file
+        try:
+            await aiunlink(cur_path)
+            self.log.info("Removed wallpaper: %s", cur_path)
+        except OSError as e:
+            self.log.exception("Failed to remove wallpaper %s", cur_path)
+            await self.backend.notify_error(f"Failed to remove: {e}")
+            return
+
+        # Also remove rounded versions for all monitors
+        if self.rounded_manager:
+            monitors = await fetch_monitors(self)
+            for monitor in monitors:
+                key = self.rounded_manager.build_key(monitor, str(cur_path))
+                rounded_path = self.rounded_manager.cache.get_path(key, "jpg")
+                if await aiexists(rounded_path):
+                    try:
+                        await aiunlink(rounded_path)
+                        self.log.debug("Removed rounded version: %s", rounded_path)
+                    except OSError:
+                        pass  # Non-critical
+
+        # Trigger next wallpaper
+        self._paused = False
+        self.next_background_event.set()
+
+    async def run_wall_cleanup(self, arg: str = "") -> str:
+        """[all] Clean up rounded images cache.
+
+        Without arguments: removes orphaned files (source no longer exists).
+        With 'all': removes ALL rounded cache files.
+
+        Example:
+            pypr wall cleanup
+            pypr wall cleanup all
+        """
+        if not self.rounded_manager:
+            return "Rounded corners not enabled, nothing to clean"
+
+        if arg.strip().lower() == "all":
+            removed = await self._clear_rounded_cache()
+            return f"Cleared {removed} rounded images"
+
+        # Orphan cleanup: find rounded files whose sources no longer exist
+        removed_orphans, removed_old = await self._cleanup_orphaned_rounded()
+
+        parts = []
+        if removed_orphans:
+            parts.append(f"{removed_orphans} orphaned")
+        if removed_old:
+            parts.append(f"{removed_old} old-format")
+
+        if parts:
+            return f"Removed {' + '.join(parts)} rounded images"
+        return "No orphaned rounded images found"
+
+    async def _clear_rounded_cache(self) -> int:
+        """Clear all files from rounded cache with throttled deletion.
+
+        Returns:
+            Number of files removed.
+        """
+        if not self.rounded_manager:
+            return 0
+
+        removed = 0
+        for cached_file in self.rounded_manager.cache.cache_dir.iterdir():
+            if await aiisfile(cached_file):
+                await aiunlink(cached_file)
+                removed += 1
+                await asyncio.sleep(0.01)  # 10ms throttle to avoid IO saturation
+        return removed
+
+    async def _cleanup_orphaned_rounded(self) -> tuple[int, int]:
+        """Remove rounded files whose source images no longer exist.
+
+        Returns:
+            Tuple of (orphaned_removed, old_format_removed).
+        """
+        if not self.rounded_manager:
+            return (0, 0)
+
+        cache_dir = self.rounded_manager.cache.cache_dir
+
+        # Build set of source hashes for current image pool
+        valid_source_hashes = set()
+        for image_path in self.image_list:
+            source_hash = self.rounded_manager.hash_source(image_path)
+            valid_source_hashes.add(source_hash)
+
+        # Find and remove orphaned/old-format files
+        removed_orphans = 0
+        removed_old = 0
+
+        for cached_file in cache_dir.iterdir():
+            if not await aiisfile(cached_file):
+                continue
+
+            if "_" not in cached_file.stem:
+                # Old format file (single hash), remove it
+                await aiunlink(cached_file)
+                removed_old += 1
+                await asyncio.sleep(0.01)  # 10ms throttle
+                continue
+
+            source_hash = cached_file.stem.split("_")[0]
+            if source_hash not in valid_source_hashes:
+                await aiunlink(cached_file)
+                removed_orphans += 1
+                await asyncio.sleep(0.01)  # 10ms throttle
+
+        return (removed_orphans, removed_old)
+
+    async def run_wall_info(self, arg: str = "") -> str:
+        """[json] Show current wallpaper information.
+
+        Args:
+            arg: Optional "json" flag for JSON output
+
+        Example:
+            pypr wall info
+            pypr wall info json
+        """
+        output_json = arg.strip().lower() == "json"
+
+        # Gather information
+        source_image = self.cur_image or ""
+        display_image = self.cur_display_image or source_image
+        source_exists = await aiexists(source_image) if source_image else False
+        display_exists = await aiexists(display_image) if display_image else False
+
+        # Determine location
+        location = "unknown"
+        if source_image:
+            cur_path = Path(source_image)
+            parent_str = str(cur_path.parent)
+            if self._online and self._online.folder_path and str(self._online.folder_path) == parent_str:
+                location = "online"
+            else:
+                for local_path in self._get_local_paths():
+                    if parent_str == str(local_path) or str(local_path) in parent_str:
+                        location = "local"
+                        break
+
+        is_rounded = display_image != source_image
+        online_enabled = self._online is not None and self._online.fetcher is not None
+        online_ratio = self.get_config_float("online_ratio")
+        online_folder = str(self._online.folder_path) if self._online and self._online.folder_path else None
+        image_count = len(self.image_list)
+
+        if output_json:
+            data = {
+                "source_image": source_image or None,
+                "display_image": display_image or None,
+                "source_exists": source_exists,
+                "display_exists": display_exists,
+                "location": location,
+                "is_rounded": is_rounded,
+                "is_paused": self._paused,
+                "online_enabled": online_enabled,
+                "online_ratio": online_ratio,
+                "online_folder": online_folder,
+                "image_count": image_count,
+            }
+            return json.dumps(data, indent=2)
+
+        # Human-readable output
+        lines = [
+            f"Source: {source_image or '(none)'}",
+            f"  exists: {'yes' if source_exists else 'no'}",
+        ]
+        if is_rounded:
+            lines.extend(
+                [
+                    f"Display: {display_image}",
+                    f"  exists: {'yes' if display_exists else 'no'}",
+                ]
+            )
+        lines.extend(
+            [
+                f"Location: {location}",
+                f"Paused: {'yes' if self._paused else 'no'}",
+                f"Online: {'enabled' if online_enabled else 'disabled'} (ratio: {online_ratio})",
+            ]
+        )
+        if online_folder:
+            lines.append(f"Online folder: {online_folder}")
+        lines.append(f"Image pool: {image_count} images")
+
+        return "\n".join(lines)
 
     async def _prepare_wallpaper(self, monitor: MonitorInfo, img_path: str) -> str:
         """Prepare the wallpaper image for the given monitor."""
@@ -166,7 +725,7 @@ class Extension(Plugin):
         def process_color(rgb: tuple[int, int, int]) -> tuple[float, float, float]:
             # reduce blue level for earth
             color_scheme = self.get_config_str("color_scheme")
-            if color_scheme == "earth":
+            if color_scheme == ColorScheme.EARTH:
                 rgb = (rgb[0], rgb[1], int(rgb[2] * 0.7))
 
             r, g, b = nicify_oklab(rgb, **get_color_scheme_props(color_scheme))
@@ -188,7 +747,7 @@ class Extension(Plugin):
     async def update_vars(self, variables: dict[str, Any], monitor: MonitorInfo, img_path: str) -> dict[str, Any]:
         """Get fresh variables for the given monitor."""
         if self.get_config_bool("unique"):
-            img_path = self.select_next_image()
+            img_path = await self.select_next_image()
         filename = await self._prepare_wallpaper(monitor, img_path)
         variables.update({"file": filename, "output": monitor.name})
         return variables
@@ -197,7 +756,7 @@ class Extension(Plugin):
         """Run one iteration of the wallpaper loop."""
         cmd_template = self.get_config("command")
         assert isinstance(cmd_template, str) or cmd_template is None
-        img_path = self.select_next_image()
+        img_path = await self.select_next_image()
         monitors: list[MonitorInfo] = await fetch_monitors(self)
 
         if cmd_template:
@@ -207,14 +766,19 @@ class Extension(Plugin):
                 await self._run_one(cmd_template, variables)
         else:
             # use hyprpaper
+            assert self._hyprpaper is not None  # Guaranteed by on_reload logic
             command_collector = []
             for monitor in monitors:
                 variables = await self.update_vars(variables, monitor, img_path)
                 self.log.debug("Setting wallpaper %s for monitor %s", variables["file"], variables.get("output"))
                 command_collector.append(apply_variables("wallpaper [output], [file]", variables))
 
-            for cmd in command_collector:
-                await self.backend.execute(["execr hyprctl hyprpaper " + cmd])
+            if not await self._hyprpaper.set_wallpaper(command_collector, self.backend):
+                await self.backend.notify_error("Could not start hyprpaper")
+                return
+
+        # Track the display path (may be rounded version of source)
+        self.cur_display_image = variables.get("file", self.cur_image)
 
         # Generate templates after wallpaper is selected
         await self._generate_templates(img_path)
@@ -228,15 +792,19 @@ class Extension(Plugin):
         post_command = self.get_config_str("post_command")
         if post_command:
             command = apply_variables(post_command, variables)
-            post_proc = await asyncio.create_subprocess_shell(command)
+            post_proc = await create_subprocess(command)
             if await post_proc.wait() != 0:
                 await self.backend.notify_error("wallpaper post_command failed")
+
+        # Prefetch next online image if enabled and previous was consumed
+        if self._online and self._online.fetcher and not self._online.prefetched_path:
+            self._tasks.create(self._prefetch_online_image())
 
     async def main_loop(self) -> None:
         """Run the main plugin loop in the 'background'."""
         self.proc = []
 
-        while self.running:
+        while self._tasks.running:
             if not self._paused:
                 self.next_background_event.clear()
                 await self.terminate()
@@ -244,14 +812,17 @@ class Extension(Plugin):
                 await self._iter_one(variables)
 
             interval_minutes = self.get_config_float("interval")
-            interval = asyncio.sleep(60 * interval_minutes)
-            await asyncio.wait(
-                [
-                    asyncio.create_task(interval),
-                    asyncio.create_task(self.next_background_event.wait()),
-                ],
+            sleep_task = asyncio.create_task(asyncio.sleep(60 * interval_minutes))
+            event_task = asyncio.create_task(self.next_background_event.wait())
+            _, pending = await asyncio.wait(
+                [sleep_task, event_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            # Cancel pending tasks to avoid leaks
+            for task in pending:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
     async def terminate(self) -> None:
         """Exit existing process if any."""
@@ -259,28 +830,82 @@ class Extension(Plugin):
             await proc.stop()
         self.proc.clear()
 
-    async def run_wall(self, arg: str) -> None:
-        """<next|clear|pause|color> skip, stop, pause or change color of background."""
-        if arg.startswith("n"):  # next
-            self._paused = False
-            self.next_background_event.set()
-        elif arg.startswith("p"):  # pause
-            self._paused = True
-        elif arg.startswith("cl"):  # clear
-            self._paused = True
-            await self.terminate()
-            if not self.get_config("command") and self.state.environment == "hyprland":
-                pkill_proc = await asyncio.create_subprocess_shell("pkill hyprpaper")
-                await pkill_proc.wait()
-            clear_command = self.get_config_str("clear_command")
-            if clear_command:
-                clear_proc = await asyncio.create_subprocess_shell(clear_command)
-                await clear_proc.wait()
-        elif arg.startswith("co"):  # color
-            # expect an #rgb color code
-            args = arg.split()
-            color = args[1]
-            with contextlib.suppress(IndexError):
-                self.config["color_scheme"] = args[2]
+    async def run_wall_next(self) -> None:
+        """Switch to the next wallpaper immediately."""
+        self._paused = False
+        self.next_background_event.set()
 
-            await self._generate_templates("color-" + color, color)
+    async def run_wall_pause(self) -> None:
+        """Pause automatic wallpaper cycling."""
+        self._paused = True
+
+    async def run_wall_clear(self) -> None:
+        """Stop cycling and clear the current wallpaper."""
+        self._paused = True
+        await self.terminate()
+        if self._hyprpaper:
+            await self._hyprpaper.stop()
+        clear_command = self.get_config_str("clear_command")
+        if clear_command:
+            clear_proc = await create_subprocess(clear_command)
+            await clear_proc.wait()
+
+    async def run_color(self, arg: str) -> None:
+        """<#RRGGBB> [scheme] Generate color palette from hex color.
+
+        Args:
+            arg: Hex color and optional scheme name
+
+        Schemes: pastel, fluo, vibrant, mellow, neutral, earth
+
+        Example:
+            pypr color #ff5500 vibrant
+        """
+        args = arg.split()
+        color = args[0]
+        with contextlib.suppress(IndexError):
+            self.config["color_scheme"] = args[1]
+
+        await self._generate_templates("color-" + color, color)
+
+    async def run_palette(self, arg: str = "") -> str:
+        """[color] [json] Show available color template variables.
+
+        Args:
+            arg: Optional hex color and/or "json" flag
+                - color: Hex color (#RRGGBB) to use for palette
+                - json: Output in JSON format instead of human-readable
+
+        Example:
+            pypr palette
+            pypr palette #ff5500
+            pypr palette json
+        """
+        args = arg.split()
+        color: str | None = None
+        output_json = False
+
+        # Parse arguments: [color] [json]
+        for a in args:
+            if a.lower() == "json":
+                output_json = True
+            elif a.startswith("#") or (len(a) == HEX_COLOR_LENGTH and all(c in "0123456789abcdefABCDEF" for c in a)):
+                color = a
+
+        # Determine base RGB color
+        if color:
+            base_rgb = hex_to_rgb(color)
+        elif self.cur_image and can_edit_image:
+            # Use colors from current wallpaper
+            dominant_colors = await asyncio.to_thread(get_dominant_colors, img_path=self.cur_image)
+            base_rgb = dominant_colors[0]
+        else:
+            # Default: Google blue #4285F4
+            base_rgb = DEFAULT_PALETTE_COLOR_RGB
+
+        theme = await detect_theme(self.log)
+        palette = generate_sample_palette(base_rgb, theme)
+
+        if output_json:
+            return palette_to_json(palette)
+        return palette_to_terminal(palette)

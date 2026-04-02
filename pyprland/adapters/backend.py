@@ -1,4 +1,14 @@
-"""Backend adapter interface."""
+"""Abstract base class defining the compositor backend interface.
+
+EnvironmentBackend defines the contract for all compositor backends:
+- Window operations (get_clients, focus, move, resize, close)
+- Monitor queries (get_monitors, get_monitor_props)
+- Command execution (execute, execute_batch, execute_json)
+- Notifications (notify, notify_info, notify_error)
+- Event parsing (parse_event)
+
+All methods accept a 'log' parameter for traceability via BackendProxy.
+"""
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -88,7 +98,7 @@ class EnvironmentBackend(ABC):
         raise RuntimeError(msg)
 
     @abstractmethod
-    async def execute(self, command: str | list | dict, *, log: Logger, **kwargs: Any) -> bool:  # noqa: ANN401
+    async def execute(self, command: str | list | dict, *, log: Logger, **kwargs: Any) -> bool:
         """Execute a command (or list of commands).
 
         Args:
@@ -98,7 +108,7 @@ class EnvironmentBackend(ABC):
         """
 
     @abstractmethod
-    async def execute_json(self, command: str, *, log: Logger, **kwargs: Any) -> Any:  # noqa: ANN401
+    async def execute_json(self, command: str, *, log: Logger, **kwargs: Any) -> Any:
         """Execute a command and return the JSON result.
 
         Args:
@@ -153,7 +163,7 @@ class EnvironmentBackend(ABC):
         clients: list[ClientInfo] | None = None,
         *,
         log: Logger,
-        **kw: Any,  # noqa: ANN401
+        **kw: Any,
     ) -> ClientInfo | None:
         """Return the properties of a client matching the given criteria.
 
@@ -165,7 +175,7 @@ class EnvironmentBackend(ABC):
         """
         if match_fn is None:
 
-            def default_match_fn(value1: Any, value2: Any) -> bool:  # noqa: ANN401
+            def default_match_fn(value1: Any, value2: Any) -> bool:
                 return bool(value1 == value2)
 
             match_fn = default_match_fn
@@ -242,11 +252,12 @@ class EnvironmentBackend(ABC):
         """
         return await self.execute(f"pin address:{address}", log=log)
 
-    async def close_window(self, address: str, *, log: Logger) -> bool:
+    async def close_window(self, address: str, *, silent: bool = True, log: Logger) -> bool:
         """Close a window.
 
         Args:
             address: Window address (without 'address:' prefix)
+            silent: Accepted for API consistency (currently unused for close)
             log: Logger to use for this operation
 
         Returns:

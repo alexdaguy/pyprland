@@ -1,163 +1,136 @@
-const enableVersions = true;
+/**
+ * VitePress configuration with dynamic version discovery.
+ *
+ * Sidebar configurations are loaded from sidebar.json files:
+ * - site/sidebar.json for current version
+ * - site/versions/<version>/sidebar.json for archived versions
+ *
+ * Versions are automatically discovered by scanning the versions/ folder.
+ */
+
+import { readdirSync, readFileSync, existsSync } from "fs";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
 import { defineConfig } from "vitepress";
 import { withMermaid } from "vitepress-plugin-mermaid";
 
-const version_names = [
-  "2.3.5",
-  "2.3.6,7",
-  "2.3.8",
-  "2.4.0",
-  "2.4.1+",
-  "2.4.6",
-  "2.4.7",
-  "2.5.x",
-  "2.6.2",
-];
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const siteDir = join(__dirname, "..");
 
-const extra_versions = {
-  items: [
-    {
-      text: "Current",
-      link: "/",
-    },
-  ],
-};
+/**
+ * Load sidebar configuration from a sidebar.json file.
+ * @param {string} dir - Directory containing sidebar.json
+ * @returns {Array|null} - Sidebar items array or null if not found
+ */
+function loadSidebar(dir) {
+  const sidebarPath = join(dir, "sidebar.json");
+  if (!existsSync(sidebarPath)) {
+    console.warn(`Warning: sidebar.json not found in ${dir}`);
+    return null;
+  }
 
-for (const version of version_names) {
-  extra_versions.items.push({
-    text: version,
-    link: `/versions/${version}/`,
-  });
+  try {
+    const config = JSON.parse(readFileSync(sidebarPath, "utf-8"));
+    return [...config.main, config.plugins];
+  } catch (e) {
+    console.error(`Error loading sidebar from ${sidebarPath}:`, e.message);
+    return null;
+  }
 }
 
-const menu = [
-  {
-    text: "Versions",
-    items: [extra_versions],
-  },
-];
+/**
+ * Discover all versions and build sidebar + nav configuration.
+ * @returns {{ sidebar: Object, nav: Array }}
+ */
+function buildVersionedConfig() {
+  const sidebar = {};
+  const versionItems = [{ text: "Current", link: "/" }];
 
-const plugin_list = {
-  text: "Featured plugins",
-  collapsible: true,
-  collapsed: false,
-  items: [
-    { text: "Expose", link: "./expose" },
-    { text: "Fcitx5 Switcher", link: "./fcitx5_switcher" },
-    { text: "Fetch client menu", link: "./fetch_client_menu" },
-    { text: "Menubar", link: "./menubar" },
-    { text: "Layout center", link: "./layout_center" },
-    { text: "Lost windows", link: "./lost_windows" },
-    { text: "Magnify", link: "./magnify" },
-    { text: "Monitors", link: "./monitors" },
-    {
-      text: "Scratchpads",
-      link: "./scratchpads",
-      items: [
-        { text: "Advanced", link: "./scratchpads_advanced" },
-        { text: "Special cases", link: "./scratchpads_nonstandard" },
-      ],
-    },
-    { text: "Shift monitors", link: "./shift_monitors" },
-    { text: "Shortcuts menu", link: "./shortcuts_menu" },
-    { text: "System notifier", link: "./system_notifier" },
-    { text: "Toggle dpms", link: "./toggle_dpms" },
-    { text: "Toggle special", link: "./toggle_special" },
-    { text: "Wallpapers", link: "./wallpapers" },
-    { text: "Workspaces follow focus", link: "./workspaces_follow_focus" },
-  ],
-};
+  // Load current version sidebar
+  const currentSidebar = loadSidebar(siteDir);
+  if (currentSidebar) {
+    sidebar["/"] = currentSidebar;
+  }
 
-// https://vitepress.dev/reference/site-config
-export default withMermaid(defineConfig({
-  title: "Pyprland web",
-  base: "/pyprland/",
-  description: "The official Pyprland website",
-  themeConfig: {
-    // https://vitepress.dev/reference/default-theme-config
-    nav: menu,
-    logo: "/icon.png",
-    search: {
-      provider: "local",
-      options: {
-        miniSearch: {
-          // options: {
-          //   storeFields: ['term']
-          // },
-          searchOptions: {
-            processTerm: (text) => {
-              console.log(text);
-              // if matching '/versions/' return null
-              if (text.includes("/versions/")) {
-                return null;
-              }
-              return text;
-            },
+  // Discover and load archived versions
+  const versionsDir = join(siteDir, "versions");
+  if (existsSync(versionsDir)) {
+    const versions = readdirSync(versionsDir, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name)
+      // Sort versions: newest first (descending)
+      .sort((a, b) => {
+        // Extract numeric parts for comparison
+        const aParts = a
+          .replace(/[^0-9.]/g, "")
+          .split(".")
+          .map(Number);
+        const bParts = b
+          .replace(/[^0-9.]/g, "")
+          .split(".")
+          .map(Number);
+        for (let i = 0; i < Math.max(aParts.length, bParts.length); i++) {
+          const aVal = aParts[i] || 0;
+          const bVal = bParts[i] || 0;
+          if (bVal !== aVal) return bVal - aVal;
+        }
+        return 0;
+      });
+
+    for (const version of versions) {
+      const versionDir = join(versionsDir, version);
+      const versionSidebar = loadSidebar(versionDir);
+
+      if (versionSidebar) {
+        sidebar[`/versions/${version}/`] = [
+          ...versionSidebar,
+          { text: "Return to latest version", link: "/" },
+        ];
+      }
+
+      versionItems.push({ text: version, link: `/versions/${version}/` });
+    }
+  }
+
+  const nav = [{ text: "Versions", items: [{ items: versionItems }] }];
+
+  return { sidebar, nav };
+}
+
+const { sidebar, nav } = buildVersionedConfig();
+
+export default withMermaid(
+  defineConfig({
+    title: "Pyprland docs",
+    base: "/pyprland/",
+    description: "The official Pyprland website",
+    themeConfig: {
+      nav,
+      logo: "/icon.png",
+      search: {
+        provider: "local",
+        options: {
+          _render(src, env, md) {
+            const html = md.render(src, env);
+            // Exclude versioned pages from search index
+            if (env.relativePath.startsWith("versions/")) return "";
+            // Also respect frontmatter search: false
+            if (env.frontmatter?.search === false) return "";
+            return html;
           },
         },
       },
-    },
-    outline: {
-      level: [2, 3],
-    },
-    sidebar: {
-      collapsible: true,
-      collapsed: true,
-      "/versions": [
-        { text: "Getting Started", link: "./Getting-started" },
-        { text: "Configuration", link: "./Configuration" },
-        { text: "Commands", link: "./Commands" },
-        { text: "Plugins", link: "./Plugins" },
-        { text: "Troubleshooting", link: "./Troubleshooting" },
-        { text: "Development", link: "./Development" },
-        { text: "Examples", link: "./Examples" },
+      outline: { level: [2, 3] },
+      sidebar,
+      socialLinks: [
+        { icon: "github", link: "https://github.com/fdev31/pyprland" },
         {
-          text: "Architecture",
-          link: "./Architecture",
-          collapsed: true,
-          items: [
-            { text: "Overview", link: "./Architecture_overview" },
-            { text: "Core Components", link: "./Architecture_core" },
-          ],
-        },
-        plugin_list,
-        {
-          text: "Return to latest version",
-          link: "/",
+          icon: "discord",
+          link: "https://discord.com/channels/1055990214411169892/1230972154330218526",
         },
       ],
-      "/": [
-        { text: "Getting Started", link: "./Getting-started" },
-        { text: "Configuration", link: "./Configuration" },
-        { text: "Commands", link: "./Commands" },
-        { text: "Plugins", link: "./Plugins" },
-        { text: "Troubleshooting", link: "./Troubleshooting" },
-        { text: "Development", link: "./Development" },
-        { text: "Examples", link: "./Examples" },
-        {
-          text: "Architecture",
-          link: "./Architecture",
-          collapsed: true,
-          items: [
-            { text: "Overview", link: "./Architecture_overview" },
-            { text: "Core Components", link: "./Architecture_core" },
-          ],
-        },
-        plugin_list,
-      ],
     },
-    socialLinks: [
-      { icon: "github", link: "https://github.com/fdev31/pyprland" },
-      {
-        icon: "discord",
-        link: "https://discord.com/channels/1055990214411169892/1230972154330218526",
-      },
-    ],
-  },
-  mermaid: {
-    // Mermaid configuration options
-  },
-  mermaidPlugin: {
-    class: "mermaid",
-  },
-}));
+    mermaid: {},
+    mermaidPlugin: { class: "mermaid" },
+  }),
+);

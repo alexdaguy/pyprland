@@ -1,13 +1,14 @@
 """Add system notifications based on journal logs."""
 
 import asyncio
-import contextlib
 import re
 from copy import deepcopy
-from typing import cast
+from typing import Any, cast
 
 from ..adapters.colors import convert_color
+from ..aioops import TaskManager
 from ..common import apply_filter, notify_send
+from ..models import ReloadReason
 from ..process import ManagedProcess
 from ..validation import ConfigField, ConfigItems
 from .interface import Plugin
@@ -48,6 +49,7 @@ class Extension(Plugin):
             description="""This is the long-running command (eg: `tail -f <filename>`) returning the stream of text that will be updated.
             A common option is the system journal output (eg: `journalctl -u nginx`)""",
             recommended=True,
+            category="basic",
         ),
         ConfigField(
             "parser",
@@ -55,54 +57,67 @@ class Extension(Plugin):
             default={},
             description="""Sets the list of rules / parser to be used to extract lines of interest
             Must match a list of rules defined as `system_notifier.parsers.<parser_name>`.""",
+            category="basic",
         ),
-        ConfigField("parsers", dict, default={}, description="Custom parser definitions (name -> list of rules)", recommended=True),
-        ConfigField("sources", list, default=[], description="Source definitions with command and parser", recommended=True),
+        ConfigField(
+            "parsers",
+            dict,
+            default={},
+            description="""Custom parser definitions (name -> list of rules).
+            Each rule has: pattern (required), filter, color (defaults to default_color), duration (defaults to 3 seconds)""",
+            recommended=True,
+            category="parsers",
+        ),
+        ConfigField(
+            "sources", list, default=[], description="Source definitions with command and parser", recommended=True, category="basic"
+        ),
         ConfigField(
             "pattern",
             str,
             default="",
             description="The pattern is any regular expression that should trigger a match.",
             recommended=True,
+            category="basic",
         ),
-        ConfigField("default_color", str, default="#5555AA", description="Default notification color"),
-        ConfigField("use_notify_send", bool, default=False, description="Use notify-send instead of Hyprland notifications"),
+        ConfigField("default_color", str, default="#5555AA", description="Default notification color", category="appearance"),
+        ConfigField(
+            "use_notify_send", bool, default=False, description="Use notify-send instead of Hyprland notifications", category="behavior"
+        ),
     )
+
+    _tasks: TaskManager
+    sources: dict[str, ManagedProcess]
+    parsers: dict[str, asyncio.Queue[Any]]
 
     def __init__(self, name: str) -> None:
         """Initialize the class."""
         super().__init__(name)
-        self.tasks: list[asyncio.Task] = []
-        self.sources: dict[str, ManagedProcess] = {}
-        self.parsers: dict[str, asyncio.Queue] = {}
-        self.running = True
+        self._tasks = TaskManager()
+        self.sources = {}
+        self.parsers = {}
 
-    async def on_reload(self) -> None:
+    async def on_reload(self, reason: ReloadReason = ReloadReason.RELOAD) -> None:
         """Reload the plugin."""
+        _ = reason  # unused
         await self.exit()
-        self.running = True
+        self._tasks.start()
         parsers = deepcopy(builtin_parsers)
         parsers.update(self.get_config_dict("parsers"))
         for name, pprops in parsers.items():
-            self.tasks.append(asyncio.create_task(self.start_parser(name, pprops)))
+            self._tasks.create(self.start_parser(name, pprops))
             self.parsers[name] = asyncio.Queue()
             self.log.debug("Loaded parser %s", name)
 
         for props in self.get_config_list("sources"):
             assert props["parser"] in self.parsers, f"{props['parser']} was not found in {self.parsers}"
             self.log.debug("Loaded source %s => %s", props["command"], props["parser"])
-            self.tasks.append(asyncio.create_task(self.start_source(props)))
+            self._tasks.create(self.start_source(props))
 
     async def exit(self) -> None:
         """Exit function."""
-        self.running = False
-        for task in self.tasks:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        await self._tasks.stop()
         for source in self.sources.values():
             await source.stop()
-        self.tasks.clear()
         self.sources.clear()
 
     async def start_source(self, props: dict[str, str]) -> None:
@@ -124,7 +139,7 @@ class Extension(Plugin):
         await asyncio.sleep(1)
         # Read stdout line by line and push to parser
         async for line in proc.iter_lines():
-            if not self.running:
+            if not self._tasks.running:
                 break
             if line:
                 for q in queues:
@@ -151,7 +166,7 @@ class Extension(Plugin):
             }
             for prop in props
         ]
-        while self.running:
+        while self._tasks.running:
             content = await q.get()
             for rule in rules:
                 if rule["pattern"].search(content):

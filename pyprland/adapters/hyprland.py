@@ -1,4 +1,9 @@
-"""Hyprland adapter."""
+"""Hyprland compositor backend implementation.
+
+Primary backend for Hyprland, using its Unix socket IPC protocol.
+Provides full functionality including batched commands, JSON queries,
+native notifications, and Hyprland-specific event parsing.
+"""
 
 from logging import Logger
 from typing import Any, cast
@@ -23,7 +28,7 @@ class HyprlandBackend(EnvironmentBackend):
         return result
 
     @retry_on_reset
-    async def execute(self, command: str | list | dict, *, log: Logger, **kwargs: Any) -> bool:  # noqa: ANN401
+    async def execute(self, command: str | list | dict, *, log: Logger, **kwargs: Any) -> bool:
         """Execute a command (or list of commands).
 
         Args:
@@ -61,7 +66,7 @@ class HyprlandBackend(EnvironmentBackend):
         return r
 
     @retry_on_reset
-    async def execute_json(self, command: str, *, log: Logger, **kwargs: Any) -> Any:  # noqa: ANN401, ARG002
+    async def execute_json(self, command: str, *, log: Logger, **kwargs: Any) -> Any:
         """Execute a command and return the JSON result.
 
         Args:
@@ -93,8 +98,8 @@ class HyprlandBackend(EnvironmentBackend):
             client
             for client in cast("list[ClientInfo]", await self.execute_json("clients", log=log))
             if (not mapped or client["mapped"])
-            and (workspace is None or cast("str", client["workspace"]["name"]) == workspace)
-            and (workspace_bl is None or cast("str", client["workspace"]["name"]) != workspace_bl)
+            and (workspace is None or client["workspace"]["name"] == workspace)
+            and (workspace_bl is None or client["workspace"]["name"] != workspace_bl)
         ]
 
     async def get_monitors(self, *, log: Logger, include_disabled: bool = False) -> list[MonitorInfo]:
@@ -129,7 +134,7 @@ class HyprlandBackend(EnvironmentBackend):
             # We assume it worked, similar to current implementation
             # detailed error checking for batch is limited in current ipc.py implementation
 
-    def parse_event(self, raw_data: str, *, log: Logger) -> tuple[str, Any] | None:  # noqa: ARG002
+    def parse_event(self, raw_data: str, *, log: Logger) -> tuple[str, Any] | None:
         """Parse a raw event string into (event_name, event_data).
 
         Args:

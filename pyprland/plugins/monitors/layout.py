@@ -4,8 +4,8 @@ from collections import defaultdict
 from typing import Any
 
 from ...models import MonitorInfo
+from .schema import MONITOR_PROPS
 
-MONITOR_PROPS = {"resolution", "rate", "scale", "transform"}
 MAX_CYCLE_PATH_LENGTH = 10
 
 
@@ -286,7 +286,7 @@ def find_cycle_path(config: dict[str, Any], unprocessed: list[str]) -> str:
     if current and current in path:
         # Found the cycle - show it
         cycle_start = path.index(current)
-        cycle = path[cycle_start:] + [current]
+        cycle = [*path[cycle_start:], current]
         return " -> ".join(cycle)
 
     # No clear cycle found, just list unprocessed

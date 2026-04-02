@@ -4,10 +4,10 @@ import asyncio
 import subprocess
 from collections.abc import Iterable
 from logging import Logger
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from ..common import apply_variables, get_logger
-from ..models import PyprError
+from ..models import PyprError, ReloadReason
 from ..validation import ConfigField, ConfigItems
 
 if TYPE_CHECKING:
@@ -25,7 +25,7 @@ class MenuEngine:
     " process name for this engine "
     proc_extra_parameters: str = ""
     " process parameters to use for this engine "
-    proc_detect_parameters: list[str] = ["--help"]
+    proc_detect_parameters: ClassVar[list[str]] = ["--help"]
     " process parameters used to check if the engine can run "
 
     def __init__(self, extra_parameters: str) -> None:
@@ -106,8 +106,9 @@ BemenuMenu = _menu("bemenu", "-c")
 FuzzelMenu = _menu("fuzzel", "--match-mode=fuzzy -d -p '[prompt]'")
 WalkerMenu = _menu("walker", "-d -k -p '[prompt]'")
 AnyrunMenu = _menu("anyrun", "--plugins libstdin.so --show-results-immediately true")
+VicinaeMenu = _menu("vicinae", "dmenu --no-quick-look")
 
-every_menu_engine = [FuzzelMenu, TofiMenu, RofiMenu, WofiMenu, BemenuMenu, DmenuMenu, AnyrunMenu, WalkerMenu]
+every_menu_engine = [FuzzelMenu, TofiMenu, RofiMenu, WofiMenu, BemenuMenu, DmenuMenu, AnyrunMenu, WalkerMenu, VicinaeMenu]
 
 MENU_ENGINE_CHOICES: list[str] = [engine.proc_name for engine in every_menu_engine]
 """List of available menu engine names, derived from every_menu_engine."""
@@ -153,11 +154,13 @@ class MenuMixin:
             str,
             description="Menu engine to use",
             choices=MENU_ENGINE_CHOICES,
+            category="menu",
         ),
         ConfigField(
             "parameters",
             str,
             description="Extra parameters for the menu engine command",
+            category="menu",
         ),
     )
     """Schema for menu configuration fields. Plugins using MenuMixin should include this in their config_schema."""
@@ -178,6 +181,7 @@ class MenuMixin:
             self.log.info("Using %s engine", self.menu.proc_name)
             self._menu_configured = True
 
-    async def on_reload(self) -> None:
+    async def on_reload(self, reason: ReloadReason = ReloadReason.RELOAD) -> None:
         """Reset the configuration status."""
+        _ = reason  # unused
         self._menu_configured = False

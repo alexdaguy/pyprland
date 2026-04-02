@@ -3,7 +3,7 @@
 Pypr consists of two things:
 
 - **A tool**: `pypr` which runs the daemon (service) and allows you to interact with it
-- **A config file**: `~/.config/hypr/pyprland.toml` using the [TOML](https://toml.io/en/) format
+- **A config file**: `~/.config/pypr/config.toml` using the [TOML](https://toml.io/en/) format
 
 > [!important]
 > - With no arguments, `pypr` runs the daemon (doesn't fork to background)
@@ -12,6 +12,9 @@ Pypr consists of two things:
 > [!tip]
 > For keybindings, use `pypr-client` instead of `pypr` for faster response (~1ms vs ~50ms). See [Commands: pypr-client](./Commands#pypr-client) for details.
 
+> [!tip]
+> Prefer a visual editor? Run `pypr-gui` to configure pyprland from your browser. See [Commands: pypr-gui](./Commands#pypr-gui) for details.
+
 ## Installation
 
 Check your OS package manager first:
@@ -19,7 +22,15 @@ Check your OS package manager first:
 - **Arch Linux**: Available on AUR, e.g., with [yay](https://github.com/Jguer/yay): `yay pyprland`
 - **NixOS**: See the [Nix](./Nix) page for instructions
 
-Otherwise, install via pip (preferably in a [virtual environment](./InstallVirtualEnvironment)):
+Otherwise, you may want using the [uv](https://docs.astral.sh/uv/) way:
+
+```sh
+# Install pyprland
+uv tool install pyprland
+```
+
+
+else, install via pip (in a [virtual environment](./InstallVirtualEnvironment)):
 
 ```sh
 pip install pyprland
@@ -27,17 +38,18 @@ pip install pyprland
 
 ## Minimal Configuration
 
-Create `~/.config/hypr/pyprland.toml` with:
+Create `~/.config/pypr/config.toml` with:
 
 ```toml
 [pyprland]
 plugins = [
     "scratchpads",
+    "gamemode",
     "magnify",
 ]
 ```
 
-This enables two popular plugins. See the [Plugins](./Plugins) page for the full list.
+This enables only few plugins. See the [Plugins](./Plugins) page for the full list.
 
 ## Running the Daemon
 
@@ -53,6 +65,12 @@ exec-once = /usr/bin/pypr
 ```
 
 For debugging, use:
+
+```ini
+exec-once = /usr/bin/pypr --debug
+```
+
+Or to also save logs to a file:
 
 ```ini
 exec-once = /usr/bin/pypr --debug $HOME/pypr.log

@@ -1,42 +1,50 @@
 [project]
 name = "pyprland"
-version = "2.6.2"
-description = "Hyperland plugin system - batteries included"
+version = "3.3.0"
+description = "A companion for your desktop UX"
 authors = [
-    { name = "Fabien Devaux", email = "fdev31 <fdev31@gmail.com>" },
-]
-license = "MIT"
-readme = "README.md"
-homepage = "https://github.com/hyprland-community/pyprland/"
-packages = [
-    { include = "pyprland" },
+    { name = "Fabien Devaux", email = "fdev31@gmail.com" },
 ]
 requires-python = ">=3.11"
+readme = "README.md"
+license = "MIT"
+classifiers = []
 dependencies = [
-    "aiofiles >= 23.2.1",
-    "pillow[rounded] >= 10.0.0",
+    "aiofiles",
+    "aiohttp",
+    "pillow",
 ]
+
+[project.urls]
+Homepage = "https://github.com/hyprland-community/pyprland/"
 
 [project.scripts]
 pypr = "pyprland.command:main"
+pypr-quickstart = "pyprland.quickstart:main"
+pypr-gui = "pyprland.gui:main"
 
 [dependency-groups]
 dev = [
-    "pytest >=7.4.3",
-    "pytest-asyncio >=0.23.2",
-    "pytest-mock >=3.12.0",
-    "vulture >=2.11",
-    "coverage >=7.4.1",
-    "mypy >=1.8.0",
-    "pdoc >=14.4.0",
+    "black",
+    "coverage",
+    "flake8",
+    "mypy",
+    "pdoc",
+    "pre-commit>=4.5.1",
+    "pydantic",
+    "pylint",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-mock",
+    "ruff",
+    "types-aiofiles",
+    "vulture",
 ]
-lint = [
-    "black >=24.1.1",
-    "flake8 >=7.0.0",
-    "pydantic >=2.6.1",
-    "pylint >=3.0.3",
-    "ruff >=0.4.2",
-    "types-aiofiles >=25.1.0.20251011",
+quickstart = [
+    "questionary>=2.1.1",
+]
+vreg = [
+    "pyglet",
 ]
 
 [tool.ruff]
@@ -61,7 +69,9 @@ fixable = [
 ignore = [
     "ANN002",
     "ANN003",
+    "RUF100",
     "ANN204",
+    "ANN401",
     "D105",
     "D107",
     "E203",
@@ -82,11 +92,10 @@ select = [
     "ARG",
     "ASYNC",
     "B",
-    "B",
+    "BLE",
     "C",
     "C4",
     "C90",
-    "D",
     "D",
     "DTZ",
     "E",
@@ -96,19 +105,25 @@ select = [
     "FA",
     "FIX",
     "FLY",
+    "FURB",
+    "G",
     "I",
     "ICN",
     "INP",
     "INT",
     "ISC",
     "LOG",
+    "N",
     "PERF",
     "PIE",
+    "PL",
     "PT",
+    "PTH",
     "PYI",
     "Q",
     "RET",
     "RSE",
+    "RUF",
     "S",
     "SIM",
     "SLF",
@@ -117,23 +132,38 @@ select = [
     "TCH",
     "TD",
     "TID",
-    "ASYNC1",
+    "TRY",
     "UP",
     "W",
     "YTT",
     "ANN",
-    "N",
-    "G",
-    "PL",
-    "TRY",
+    "ASYNC1",
 ]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
+[tool.ruff.lint.per-file-ignores]
+"pyprland/adapters/fallback.py" = [
+    "ARG002",
+]
+"pyprland/adapters/niri.py" = [
+    "ARG002",
+]
+"pyprland/adapters/hyprland.py" = [
+    "ARG002",
+]
+"pyprland/adapters/backend.py" = [
+    "ARG002",
+]
+
 [tool.ruff.format]
 indent-style = "space"
 line-ending = "auto"
+
+[[tool.mypy.overrides]]
+module = "questionary"
+ignore_missing_imports = true
 
 [tool.pylsp-mypy]
 enabled = true
@@ -147,7 +177,16 @@ exclude = [
 
 [build-system]
 requires = [
-    "poetry-core",
+    "hatchling",
 ]
-build-backend = "poetry.core.masonry.api"
+build-backend = "hatchling.build"
+
+[tool.hatch.build.hooks.custom]
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "pyprland",
+    "client/pypr-client.c",
+    "hatch_build.py",
+]
 

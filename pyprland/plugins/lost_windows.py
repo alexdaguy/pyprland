@@ -1,9 +1,6 @@
 """Moves unreachable client windows to the currently focused workspace."""
 
-from typing import cast
-
-from ..models import ClientInfo, MonitorInfo
-from ..validation import ConfigItems
+from ..models import ClientInfo, Environment, MonitorInfo
 from .interface import Plugin
 
 
@@ -19,23 +16,16 @@ def contains(monitor: MonitorInfo, window: ClientInfo) -> bool:
     return bool(window["at"][1] >= monitor["y"] and window["at"][1] < monitor["y"] + monitor["height"])
 
 
-class Extension(Plugin):
+class Extension(Plugin, environments=[Environment.HYPRLAND]):
     """Brings lost floating windows (which are out of reach) to the current workspace."""
-
-    environments = ["hyprland"]
-
-    # This plugin has no configuration options
-    config_schema = ConfigItems()
 
     async def run_attract_lost(self) -> None:
         """Brings lost floating windows to the current workspace."""
         monitors = await self.backend.get_monitors()
-        windows = cast("list", await self.get_clients())
+        windows = await self.get_clients()
         lost = [win for win in windows if win["floating"] and not any(contains(mon, win) for mon in monitors)]
-        try:
-            focused = await self.backend.get_monitor_props()
-        except RuntimeError:
-            self.log.warning("No focused monitor found")
+        focused = await self.get_focused_monitor_or_warn()
+        if focused is None:
             return
         interval = focused["width"] / (1 + len(lost))
         interval_y = focused["height"] / (1 + len(lost))

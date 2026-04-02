@@ -1,13 +1,8 @@
 """Plugin template."""
 
-from ..validation import ConfigItems
+from ..models import Environment
 from .interface import Plugin
 
 
-class Extension(Plugin):
+class Extension(Plugin, environments=[Environment.HYPRLAND]):
     """Sample plugin template."""
-
-    environments = ["hyprland"]
-
-    # This plugin has no configuration options (template)
-    config_schema = ConfigItems()

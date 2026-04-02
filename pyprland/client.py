@@ -1,30 +1,48 @@
 """Client-side functions for pyprland CLI."""
 
 import asyncio
+import contextlib
 import os
 import sys
 
 from . import constants as pyprland_constants
-from .common import run_interactive_program
-from .manager import Pyprland
+from .commands.parsing import normalize_command_name
+from .common import get_logger, notify_send, run_interactive_program
 from .models import ExitCode, ResponsePrefix
-from .validate_cli import run_validate
 
 __all__ = ["run_client"]
 
 
+def _get_config_file_path() -> str:
+    """Get the config file path, checking new location then legacy fallback.
+
+    Returns:
+        Path to the config file as a string.
+    """
+    config_path = pyprland_constants.CONFIG_FILE
+    legacy_path = pyprland_constants.LEGACY_CONFIG_FILE
+    if config_path.exists():
+        return str(config_path)
+    if legacy_path.exists():
+        return str(legacy_path)
+    # Default to new path (will be created by user)
+    return str(config_path)
+
+
 async def run_client() -> None:
     """Run the client (CLI)."""
-    manager = Pyprland()
+    log = get_logger("client")
 
     if sys.argv[1] == "edit":
         editor = os.environ.get("EDITOR", os.environ.get("VISUAL", "vi"))
-        filename = os.path.expanduser(pyprland_constants.CONFIG_FILE)
+        filename = _get_config_file_path()
         run_interactive_program(f'{editor} "{filename}"')
         sys.argv[1] = "reload"
 
     elif sys.argv[1] == "validate":
         # Validate doesn't require daemon - run locally and exit
+        from .validate_cli import run_validate  # noqa: PLC0415
+
         run_validate()
         return
 
@@ -34,15 +52,16 @@ async def run_client() -> None:
     try:
         reader, writer = await asyncio.open_unix_connection(pyprland_constants.CONTROL)
     except (ConnectionRefusedError, FileNotFoundError):
-        manager.log.critical(
+        log.critical(
             "Cannot connect to pyprland daemon at %s.\nIs the daemon running? Start it with: pypr (no arguments)",
             pyprland_constants.CONTROL,
         )
-        await manager.backend.notify_error("Pypr can't connect. Is daemon running?")
+        with contextlib.suppress(Exception):
+            await notify_send("Pypr can't connect. Is daemon running?", icon="dialog-error")
         sys.exit(ExitCode.CONNECTION_ERROR)
 
     args = sys.argv[1:]
-    args[0] = args[0].replace("-", "_")
+    args[0] = normalize_command_name(args[0])
     writer.write((" ".join(args) + "\n").encode())
     writer.write_eof()
     await writer.drain()
@@ -58,9 +77,16 @@ async def run_client() -> None:
         sys.exit(ExitCode.COMMAND_ERROR)
     elif return_value.startswith(f"{ResponsePrefix.OK}"):
         # Command succeeded, check for additional output after OK
-        remaining = return_value[len(ResponsePrefix.OK) :].strip()
-        if remaining:
-            print(remaining)
+        remaining = return_value[len(ResponsePrefix.OK) :]
+        if remaining.startswith(": "):
+            # Success message format: "OK: message\n"
+            print(remaining[2:].strip())
+        elif remaining.startswith("\n"):
+            # Content format: "OK\n<content>"
+            content = remaining[1:].rstrip("\n")
+            if content:
+                print(content)
+        # "OK\n" with no content: print nothing
         sys.exit(ExitCode.SUCCESS)
     else:
         # Legacy response (version, help, dumpjson) - print as-is

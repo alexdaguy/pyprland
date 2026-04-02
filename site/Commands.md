@@ -1,7 +1,7 @@
 # Commands
 
 <script setup>
-import BuiltinCommands from './components/BuiltinCommands.vue'
+import PluginCommands from './components/PluginCommands.vue'
 </script>
 
 This page covers the `pypr` command-line interface and available commands.
@@ -15,6 +15,9 @@ The `pypr` command operates in two modes:
 | `pypr` | Daemon | Starts the Pyprland daemon (foreground) |
 | `pypr <command>` | Client | Sends a command to the running daemon |
 
+
+There is also an optional `pypr-client` command which is designed for running in keyboard-bindings since it starts faster but doesn't support every built-in command (eg: `validate`, `edit`).
+
 > [!tip]
 > Command names can use dashes or underscores interchangeably.
 > E.g., `pypr shift_monitors` and `pypr shift-monitors` are equivalent.
@@ -23,11 +26,11 @@ The `pypr` command operates in two modes:
 
 These commands are always available, regardless of which plugins are loaded:
 
-<BuiltinCommands />
+<PluginCommands plugin="pyprland" />
 
 ## Plugin Commands
 
-Each plugin can add its own commands. Use `pypr help` to see all available commands for your configuration.
+Each plugin can add its own commands. Use `pypr help` to see the commands made available by the list of plugins you set in your configuration file.
 
 Examples:
 - `scratchpads` plugin adds: `toggle`, `show`, `hide`
@@ -45,16 +48,21 @@ Pyprland can generate shell completions dynamically based on your loaded plugins
 With the daemon running:
 
 ```sh
-pypr compgen bash   # Install bash completions
-pypr compgen zsh    # Install zsh completions
-pypr compgen fish   # Install fish completions
+# Output to stdout (redirect to file)
+pypr compgen zsh > ~/.zsh/completions/_pypr
+
+# Install to default user path
+pypr compgen bash default
+pypr compgen zsh default
+pypr compgen fish default
+
+# Install to custom path (absolute or ~/)
+pypr compgen bash ~/custom/path/pypr
+pypr compgen zsh /etc/zsh/completions/_pypr
 ```
 
-You can also specify a custom path:
-
-```sh
-pypr compgen bash /custom/path/pypr
-```
+> [!warning]
+> Relative paths may not do what you expect. Use `default`, an absolute path, or a `~/` path.
 
 ### Default Installation Paths
 
@@ -112,9 +120,42 @@ bind = $mainMod SHIFT, Z, exec, $pypr zoom
 
 For technical details about the client-daemon protocol, see [Architecture: Socket Protocol](./Architecture_core#pyprland-socket-protocol).
 
+## pypr-gui {#pypr-gui}
+
+`pypr-gui` is a web-based configuration editor. It starts a local HTTP server and opens a browser interface for viewing and editing your pyprland configuration.
+
+### Features
+
+- **Plugin browser**: enable/disable plugins with checkboxes
+- **Schema-driven forms**: each plugin's options are presented with types, defaults, descriptions, and validation
+- **Validate / Save / Apply**: check your config for errors, save to disk, or save and live-reload the running daemon in one click
+- **Multi-file support**: saves per-plugin files under `conf.d/`, keeping your configuration tidy (see [Multiple Configuration Files](./MultipleConfigurationFiles))
+
+### Usage
+
+```sh
+pypr-gui              # Start server and open browser
+pypr-gui -s           # Print URL (start server in background if needed)
+pypr-gui -w           # Open browser (explicit, same as default)
+pypr-gui --no-browser # Start server without opening browser
+pypr-gui --port 9000  # Use a specific port (default: 18099)
+```
+
+The server listens on `127.0.0.1:18099` by default (not exposed to the network).
+If an instance is already running, `pypr-gui` will reuse it instead of starting a new one.
+
+> [!note]
+> The pyprland daemon does **not** need to be running to edit and validate your configuration. However, the **Apply** action (save + reload) requires a running daemon.
+
 ## Debugging
 
 To run the daemon with debug logging:
+
+```sh
+pypr --debug
+```
+
+To also save logs to a file:
 
 ```sh
 pypr --debug $HOME/pypr.log

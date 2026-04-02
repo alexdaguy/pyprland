@@ -5,7 +5,8 @@ from typing import Any
 
 from ...adapters.niri import niri_output_to_monitor_info
 from ...aioops import DebouncedTask
-from ...models import MonitorInfo
+from ...models import Environment, MonitorInfo, ReloadReason
+from ...process import create_subprocess
 from ...validation import ConfigField, ConfigItems
 from ..interface import Plugin
 from .commands import (
@@ -16,63 +17,57 @@ from .commands import (
     build_niri_transform_action,
 )
 from .layout import (
-    MONITOR_PROPS,
     build_graph,
     compute_positions,
     find_cycle_path,
 )
 from .resolution import get_monitor_by_pattern, resolve_placement_config
+from .schema import MONITOR_PROPS_SCHEMA, validate_placement_keys
 
 
-def _check_placement_keys(value: dict[str, Any]) -> list[str]:
-    """Validator for placement config keys.
-
-    Args:
-        value: The placement configuration dictionary
-    """
-    errors = []
-    valid_props = MONITOR_PROPS.union({"disables"})
-    valid_keys = {"top", "bottom", "left", "right"}
-    for rules in value.values():
-        for key, val in rules.items():
-            if key in valid_props:
-                continue
-            if not any(key.startswith(vkey.lower()) for vkey in valid_keys):
-                errors.append(f"Invalid placement rule key: {key}")
-            elif not isinstance(val, str) and not all(isinstance(o, str) for o in val):
-                errors.append(f"Invalid placement value: {val}")
-    return errors
-
-
-class Extension(Plugin):
+class Extension(Plugin, environments=[Environment.HYPRLAND, Environment.NIRI]):
     """Allows relative placement and configuration of monitors."""
 
-    environments = ["hyprland", "niri"]
-
     config_schema = ConfigItems(
-        ConfigField("startup_relayout", bool, default=True, description="Relayout monitors on startup"),
-        ConfigField("relayout_on_config_change", bool, default=True, description="Relayout when Hyprland config is reloaded"),
-        ConfigField("new_monitor_delay", float, default=1.0, description="Delay in seconds before handling new monitor"),
-        ConfigField("unknown", str, default="", description="Command to run when an unknown monitor is detected"),
+        ConfigField("startup_relayout", bool, default=True, description="Relayout monitors on startup", category="behavior"),
+        ConfigField(
+            "relayout_on_config_change", bool, default=True, description="Relayout when Hyprland config is reloaded", category="behavior"
+        ),
+        ConfigField(
+            "new_monitor_delay", float, default=1.0, description="Delay in seconds before handling new monitor", category="behavior"
+        ),
+        ConfigField(
+            "unknown", str, default="", description="Command to run when an unknown monitor is detected", category="external_commands"
+        ),
         ConfigField(
             "placement",
             dict,
             required=True,
             default={},
             description="Monitor placement rules (pattern -> positioning rules)",
-            validator=_check_placement_keys,
+            children=MONITOR_PROPS_SCHEMA,
+            validator=validate_placement_keys,
+            children_allow_extra=True,  # Allow dynamic placement keys (leftOf, topOf, etc.)
+            category="placement",
         ),
         ConfigField(
-            "hotplug_commands", dict, default={}, description="Commands to run when specific monitors are plugged (pattern -> command)"
+            "hotplug_commands",
+            dict,
+            default={},
+            description="Commands to run when specific monitors are plugged (pattern -> command)",
+            category="external_commands",
         ),
-        ConfigField("hotplug_command", str, default="", description="Command to run when any monitor is plugged"),
+        ConfigField(
+            "hotplug_command", str, default="", description="Command to run when any monitor is plugged", category="external_commands"
+        ),
     )
 
     _mon_by_pat_cache: dict[str, MonitorInfo]
     _relayout_debouncer: DebouncedTask
 
-    async def on_reload(self) -> None:
+    async def on_reload(self, reason: ReloadReason = ReloadReason.RELOAD) -> None:
         """Reload the plugin."""
+        _ = reason  # unused
         self._mon_by_pat_cache = {}
         self._relayout_debouncer = DebouncedTask(ignore_window=3.0)
         self._clear_mon_by_pat_cache()
@@ -88,7 +83,7 @@ class Extension(Plugin):
                 await asyncio.sleep(1)
                 await self._run_relayout()
 
-            await asyncio.create_task(_delayed_relayout())
+            await _delayed_relayout()
 
     async def event_configreloaded(self, _: str = "") -> None:
         """Relayout screens after settings has been lost."""
@@ -116,7 +111,7 @@ class Extension(Plugin):
         if not await self._run_relayout(monitors):
             default_command = self.get_config_str("unknown")
             if default_command:
-                await asyncio.create_subprocess_shell(default_command)
+                await create_subprocess(default_command)
 
     async def niri_outputschanged(self, _data: dict) -> None:
         """Handle Niri output changes.
@@ -138,7 +133,7 @@ class Extension(Plugin):
         Args:
             monitors: Optional list of monitors to use. If not provided, fetches current state.
         """
-        if self.state.environment == "niri":
+        if self.state.environment == Environment.NIRI:
             return await self._run_relayout_niri()
 
         if monitors is None:
@@ -288,7 +283,7 @@ class Extension(Plugin):
         if not positions and not has_disabled:
             return False
 
-        if self.state.environment == "niri":
+        if self.state.environment == Environment.NIRI:
             return await self._apply_niri_layout(positions, monitors_by_name, config)
 
         if positions:
@@ -380,11 +375,11 @@ class Extension(Plugin):
         for descr, command in self.get_config_dict("hotplug_commands").items():
             mon = get_monitor_by_pattern(descr, monitors_by_descr, monitors_by_name, self._mon_by_pat_cache)
             if mon and mon["name"] == name:
-                await asyncio.create_subprocess_shell(command)
+                await create_subprocess(command)
                 break
         single_command = self.get_config_str("hotplug_command")
         if single_command:
-            await asyncio.create_subprocess_shell(single_command)
+            await create_subprocess(single_command)
 
     def _clear_mon_by_pat_cache(self) -> None:
         """Clear the cache."""

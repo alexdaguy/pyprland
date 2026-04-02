@@ -13,40 +13,42 @@ from typing import Any, cast
 
 from ..common import is_rotated
 from ..constants import MIN_CLIENTS_FOR_LAYOUT
-from ..models import ClientInfo
+from ..models import ClientInfo, Environment, ReloadReason
 from ..validation import ConfigField, ConfigItems
 from .interface import Plugin
 
 
-class Extension(Plugin):
+class Extension(Plugin, environments=[Environment.HYPRLAND]):
     """A workspace layout where one window is centered and maximized while others are in the background."""
 
-    environments = ["hyprland"]
-
     config_schema = ConfigItems(
-        ConfigField("margin", int, default=60, description="Margin around the centered window in pixels"),
-        ConfigField("offset", (str, list, tuple), default=[0, 0], description="Offset of the centered window as 'X Y' or [X, Y]"),
-        ConfigField("style", list, default=[], description="Window rules to apply to the centered window"),
-        ConfigField("captive_focus", bool, default=False, description="Keep focus on the centered window"),
+        ConfigField("margin", int, default=60, description="Margin around the centered window in pixels", category="basic"),
+        ConfigField(
+            "offset", (str, list, tuple), default=[0, 0], description="Offset of the centered window as 'X Y' or [X, Y]", category="basic"
+        ),
+        ConfigField("style", list, default=[], description="Window rules to apply to the centered window", category="basic"),
+        ConfigField("captive_focus", bool, default=False, description="Keep focus on the centered window", category="behavior"),
         ConfigField(
             "on_new_client",
             str,
             default="focus",
             choices=["focus", "background", "close"],
             description="Behavior when a new window opens",
+            category="behavior",
         ),
-        ConfigField("next", str, description="Command to run when 'next' is called and layout is disabled"),
-        ConfigField("prev", str, description="Command to run when 'prev' is called and layout is disabled"),
-        ConfigField("next2", str, description="Alternative command for 'next'"),
-        ConfigField("prev2", str, description="Alternative command for 'prev'"),
+        ConfigField("next", str, description="Command to run when 'next' is called and layout is disabled", category="commands"),
+        ConfigField("prev", str, description="Command to run when 'prev' is called and layout is disabled", category="commands"),
+        ConfigField("next2", str, description="Alternative command for 'next'", category="commands"),
+        ConfigField("prev2", str, description="Alternative command for 'prev'", category="commands"),
     )
 
-    workspace_info: dict[str, dict[str, Any]] = defaultdict(lambda: {"enabled": False, "addr": ""})
+    workspace_info: dict[str, dict[str, Any]]
     last_index = 0
     command_handlers: dict[str, Callable]
 
     async def init(self) -> None:
         """Initialize the plugin."""
+        self.workspace_info = defaultdict(lambda: {"enabled": False, "addr": ""})
         self.command_handlers = {
             "toggle": self._run_toggle,
             "next": partial(self._run_changefocus, 1, default_override="next"),
@@ -129,7 +131,10 @@ class Extension(Plugin):
         """<toggle|next|prev|next2|prev2> turn on/off or change the active window.
 
         Args:
-            what: The command to run
+            what: The action to perform
+                - toggle: Enable/disable the centered layout
+                - next/prev: Focus the next/previous window in the stack
+                - next2/prev2: Alternative focus commands (configurable)
         """
         fn = self.command_handlers.get(what)
         if fn:
@@ -137,12 +142,13 @@ class Extension(Plugin):
         else:
             await self.backend.notify_error(f"unknown layout_center command: {what}")
 
-    async def on_reload(self) -> None:
+    async def on_reload(self, reason: ReloadReason = ReloadReason.RELOAD) -> None:
         """Loads the configuration and apply the tag style."""
+        _ = reason  # unused
         if not self.get_config_list("style"):
             return
-        await self.backend.execute("windowrulev2 unset, tag:layout_center", base_command="keyword")
-        commands = [f"windowrulev2 {rule}, tag:layout_center" for rule in self.get_config_list("style")]
+        await self.backend.execute("windowrule tag -layout_center", base_command="keyword")
+        commands = [f"windowrule {rule}, match:tag layout_center" for rule in self.get_config_list("style")]
         if commands:
             await self.backend.execute(commands, base_command="keyword")
 
@@ -215,10 +221,8 @@ class Extension(Plugin):
         x, y = offset_conf
         margin: tuple[int, int] = (margin_conf, margin_conf) if isinstance(margin_conf, int) else margin_conf
 
-        try:
-            monitor = await self.backend.get_monitor_props()
-        except RuntimeError:
-            self.log.warning("No focused monitor found for centered geometry calculation")
+        monitor = await self.get_focused_monitor_or_warn("centered geometry calculation")
+        if monitor is None:
             return None
 
         scale = monitor["scale"]

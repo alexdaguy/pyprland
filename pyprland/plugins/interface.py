@@ -1,18 +1,35 @@
-"""Common plugin interface."""
+"""Base Plugin class and infrastructure for Pyprland plugins.
+
+The Plugin class provides:
+- Typed configuration accessors (get_config_bool, get_config_int, etc.)
+- Schema-based validation via config_schema attribute
+- Lifecycle hooks (init, on_reload, exit)
+- Backend access for compositor operations
+- Shared state access for cross-plugin coordination
+
+Plugin authors should inherit from Plugin and implement event_* and run_*
+methods to handle compositor events and CLI commands respectively.
+"""
 
 import contextlib
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias
 
 from ..adapters.proxy import BackendProxy
 from ..common import SharedState, get_logger
 from ..config import Configuration, coerce_to_bool
-from ..models import ClientInfo
+from ..models import ClientInfo, Environment, MonitorInfo, ReloadReason
 from ..validation import ConfigItems, ConfigValidator
+
+if TYPE_CHECKING:
+    from ..manager import Pyprland
 
 ConfigValue = int | float | str | list[Any] | dict[Any, Any]
 """Type alias for values returned by get_config."""
+
+Environments: TypeAlias = list[Environment]
+"""Type alias for the Plugin.environments class variable."""
 
 
 @dataclass
@@ -41,18 +58,37 @@ class Plugin:
         - get_config_dict(name) - for dict values
 
         All config keys must be defined in config_schema for validation and defaults.
+
+    Subclass Usage:
+        Specify supported environments via class parameter:
+        >>> class Extension(Plugin, environments=[Environment.HYPRLAND]):
+        ...     pass
     """
 
     aborted = False
 
-    environments: list[str] = []
+    environments: ClassVar[Environments] = []
     " The supported environments for this plugin. Empty list means all environments. "
 
     backend: BackendProxy
     " The environment backend "
 
+    manager: "Pyprland | None"
+    " Reference to the plugin manager (set for pyprland plugin only) "
+
     config_schema: ConfigItems
     """Schema defining expected configuration fields. Override in subclasses to enable validation."""
+
+    def __init_subclass__(cls, environments: Environments | None = None, **kwargs: Any) -> None:
+        """Set plugin environments via class parameter.
+
+        Args:
+            environments: List of supported environments for this plugin
+            **kwargs: Additional keyword arguments for super().__init_subclass__
+        """
+        super().__init_subclass__(**kwargs)
+        if environments is not None:
+            cls.environments = environments
 
     def get_config(self, name: str) -> ConfigValue:
         """Get a configuration value by name.
@@ -152,6 +188,7 @@ class Plugin:
         self.log = get_logger(name)
         """ the logger to use for this plugin """
         self.config = Configuration({}, logger=self.log)
+        self.manager = None
 
     # Functions to override
 
@@ -161,10 +198,23 @@ class Plugin:
         Note that the `config` attribute isn't ready yet when this is called.
         """
 
-    async def on_reload(self) -> None:
-        """Add the code which requires the `config` attribute here.
+    async def on_reload(self, reason: ReloadReason = ReloadReason.RELOAD) -> None:
+        """Apply configuration after it has been loaded.
 
-        This is called on *init* and *reload*
+        Called both during initial plugin setup and when configuration is reloaded.
+
+        Args:
+            reason: Why the reload was triggered
+                - INIT: First load during daemon startup
+                - RELOAD: Config reload via 'pypr reload', 'pypr set', or self-restart
+
+        Example:
+            async def on_reload(self, reason: ReloadReason = ReloadReason.RELOAD) -> None:
+                if reason == ReloadReason.INIT:
+                    # Expensive one-time setup
+                    self.monitors = await self.backend.get_monitors()
+                # Always apply config
+                self._apply_config()
         """
 
     async def exit(self) -> None:
@@ -232,3 +282,24 @@ class Plugin:
             workspace_bl: Filter to blacklist a specific workspace name
         """
         return await self.backend.get_clients(mapped, workspace, workspace_bl)
+
+    async def get_focused_monitor_or_warn(self, context: str = "") -> MonitorInfo | None:
+        """Get the focused monitor, logging a warning if none found.
+
+        This is a common helper to reduce repeated try/except patterns
+        for RuntimeError when calling get_monitor_props().
+
+        Args:
+            context: Optional context for the warning message (e.g., "centered layout")
+
+        Returns:
+            MonitorInfo if found, None otherwise
+        """
+        try:
+            return await self.backend.get_monitor_props()
+        except RuntimeError:
+            msg = "No focused monitor found"
+            if context:
+                msg = f"{msg} for {context}"
+            self.log.warning(msg)
+            return None

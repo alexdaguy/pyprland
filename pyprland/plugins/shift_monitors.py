@@ -1,25 +1,21 @@
 """Shift workspaces across monitors."""
 
-from ..validation import ConfigItems
+from ..models import Environment
 from .interface import Plugin
 from .mixins import MonitorTrackingMixin
 
 MIN_MONITORS_FOR_SHIFT = 2  # Need at least 2 monitors to shift workspaces
 
 
-class Extension(MonitorTrackingMixin, Plugin):
+class Extension(MonitorTrackingMixin, Plugin, environments=[Environment.HYPRLAND]):
     """Moves workspaces from monitor to monitor (carousel)."""
-
-    environments = ["hyprland"]
-
-    config_schema = ConfigItems()
 
     monitors: list[str]
 
     async def init(self) -> None:
         """Initialize the plugin."""
         self.monitors = []
-        if self.state.environment == "niri":
+        if self.state.environment == Environment.NIRI:
             await self.niri_outputschanged({})
         else:
             self.monitors = [mon["name"] for mon in await self.backend.get_monitors()]
@@ -40,9 +36,9 @@ class Extension(MonitorTrackingMixin, Plugin):
         """<direction> Swaps monitors' workspaces in the given direction.
 
         Args:
-            arg: The direction to shift
+            arg: Integer direction (+1 or -1) to rotate workspaces across monitors
         """
-        if self.state.environment == "niri":
+        if self.state.environment == Environment.NIRI:
             # Niri doesn't support swapping workspaces between monitors easily.
             # We'll implement a "move workspace to monitor" shift instead for the active workspace.
             direction_int = int(arg)

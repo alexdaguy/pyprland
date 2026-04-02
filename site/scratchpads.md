@@ -71,34 +71,28 @@ bind = $mainMod,Y,exec,pypr attach
 > - [Advanced Configuration](./scratchpads_advanced) - unfocus, excludes, monitor overrides, and more
 > - [Troubleshooting](./scratchpads_nonstandard) - PWAs, emacsclient, custom window matching
 
-### `command` {#config-command}
-
-<ConfigDefault plugin="scratchpads" option="command" />
+### `command` <ConfigBadges plugin="scratchpads" option="command" /> {#config-command}
 
 This is the command you wish to run in the scratchpad. It supports [variables](./Variables).
 
-### `class` {#config-class}
-
-<ConfigDefault plugin="scratchpads" option="class" />
+### `class` <ConfigBadges plugin="scratchpads" option="class" /> {#config-class}
 
 Allows _Pyprland_ prepare the window for a correct animation and initial positioning.
 Check your window's class with: `hyprctl clients | grep class`
 
-### `animation` {#config-animation}
-
-<ConfigDefault plugin="scratchpads" option="animation" />
+### `animation` <ConfigBadges plugin="scratchpads" option="animation" /> {#config-animation}
 
 Type of animation to use:
 
-- `null` / `""` (no animation)
-- `fromTop` (stays close to upper screen border)
-- `fromBottom` (stays close to lower screen border)
-- `fromLeft` (stays close to left screen border)
-- `fromRight` (stays close to right screen border)
+- `fromTop` (default) stays close to upper screen border
+- `fromBottom` stays close to lower screen border
+- `fromLeft` stays close to left screen border
+- `fromRight` stays close to right screen border
+- `null` / `""` no sliding animation - also disables positioning relative to the border
 
-### `size` {#config-size}
+It is recommended to set [position](#config-position) when disabling this configuration option.
 
-<ConfigDefault plugin="scratchpads" option="size" />
+### `size` <ConfigBadges plugin="scratchpads" option="size" /> {#config-size}
 
 Each time scratchpad is shown, window will be resized according to the provided values.
 
@@ -113,9 +107,7 @@ regardless of which monitor it was first launched on.
 > - **pixels** for absolute values (`px` suffix), eg: `800px 600px`
 > - a mix is possible, eg: `800px 40%`
 
-### `position` {#config-position}
-
-<ConfigDefault plugin="scratchpads" option="position" />
+### `position` <ConfigBadges plugin="scratchpads" option="position" /> {#config-position}
 
 Overrides the automatic margin-based position.
 Sets the scratchpad client window position relative to the top-left corner.
@@ -134,30 +126,24 @@ class = "term_quake"
 
 > [!note]
 > If `position` is not provided, the window is placed according to `margin` on one axis and centered on the other.
+>
+> Hide animations then slide away from the configured coordinates — not from wherever the window was last manually moved or tiled.
 
-### `margin` {#config-margin}
-
-<ConfigDefault plugin="scratchpads" option="margin" />
+### `margin` <ConfigBadges plugin="scratchpads" option="margin" /> {#config-margin}
 
 Pixels from the screen edge when using animations. Used to position the window along the animation axis.
 
-### `max_size` {#config-max-size}
-
-<ConfigDefault plugin="scratchpads" option="max_size" />
+### `max_size` <ConfigBadges plugin="scratchpads" option="max_size" /> {#config-max-size}
 
 Maximum window size. Same format as `size`. Useful to prevent scratchpads from growing too large on big monitors.
 
-### `multi` {#config-multi}
-
-<ConfigDefault plugin="scratchpads" option="multi" />
+### `multi` <ConfigBadges plugin="scratchpads" option="multi" /> {#config-multi}
 
 When set to `false`, only one client window is supported for this scratchpad.
 Otherwise other matching windows will be **attach**ed to the scratchpad.
 Allows the `attach` command on the scratchpad.
 
-### `lazy` {#config-lazy}
-
-<ConfigDefault plugin="scratchpads" option="lazy" />
+### `lazy` <ConfigBadges plugin="scratchpads" option="lazy" /> {#config-lazy}
 
 When `true`, the scratchpad command is only started on first use instead of at startup.
 

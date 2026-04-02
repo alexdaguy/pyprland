@@ -16,6 +16,7 @@ from pyprland.plugins.wallpapers.colorutils import (
 )
 import colorsys
 from pyprland.plugins.wallpapers import Extension
+from pyprland.plugins.wallpapers.models import Theme
 from pyprland.plugins.wallpapers.theme import (
     get_color_scheme_props,
     generate_palette,
@@ -210,6 +211,175 @@ def test_nicify_oklab():
     assert 0 <= res[2] <= 255
 
 
+# --- OkLab Logical / Property Tests ---
+
+
+def _oklab_hue(rgb: tuple[int, int, int]) -> float:
+    """Helper: compute the OkLab hue angle (degrees) for an sRGB color."""
+    SRGB_LINEAR_CUTOFF = 0.04045
+
+    def to_linear(val: float) -> float:
+        val = val / 255.0
+        return val / 12.92 if val <= SRGB_LINEAR_CUTOFF else pow((val + 0.055) / 1.055, 2.4)
+
+    r_lin = to_linear(rgb[0])
+    g_lin = to_linear(rgb[1])
+    b_lin = to_linear(rgb[2])
+
+    l_val = 0.4122214708 * r_lin + 0.5363325363 * g_lin + 0.0514459929 * b_lin
+    m_val = 0.2119034982 * r_lin + 0.6806995451 * g_lin + 0.1073969566 * b_lin
+    s_val = 0.0883024619 * r_lin + 0.0853627803 * g_lin + 0.8301696993 * b_lin
+
+    l_ = pow(l_val, 1 / 3)
+    m_ = pow(m_val, 1 / 3)
+    s_ = pow(s_val, 1 / 3)
+
+    a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_
+    b_v = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
+
+    return math.degrees(math.atan2(b_v, a))
+
+
+def _hls_saturation(rgb: tuple[int, int, int]) -> float:
+    """Helper: return HLS saturation (0.0-1.0) for an sRGB color."""
+    _, _, s = colorsys.rgb_to_hls(rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0)
+    return s
+
+
+def _hue_distance(h1: float, h2: float) -> float:
+    """Shortest angular distance between two hue angles in degrees."""
+    diff = abs(h1 - h2) % 360
+    return min(diff, 360 - diff)
+
+
+def test_nicify_oklab_hue_preservation():
+    """nicify_oklab should preserve the perceptual hue of the input color.
+
+    #556677 is blue-ish and should produce a blue-ish output.
+    #557766 is green-ish and should produce a green-ish output.
+    The output hues should not converge or collapse.
+    """
+    blue_ish = (0x55, 0x66, 0x77)  # #556677
+    green_ish = (0x55, 0x77, 0x66)  # #557766
+
+    result_blue = nicify_oklab(blue_ish)
+    result_green = nicify_oklab(green_ish)
+
+    input_hue_blue = _oklab_hue(blue_ish)
+    input_hue_green = _oklab_hue(green_ish)
+    output_hue_blue = _oklab_hue(result_blue)
+    output_hue_green = _oklab_hue(result_green)
+
+    # Hue should be approximately preserved (within 30 degrees)
+    assert _hue_distance(input_hue_blue, output_hue_blue) < 30, (
+        f"Blue-ish hue shifted too much: input={input_hue_blue:.1f}° -> output={output_hue_blue:.1f}°"
+    )
+    assert _hue_distance(input_hue_green, output_hue_green) < 30, (
+        f"Green-ish hue shifted too much: input={input_hue_green:.1f}° -> output={output_hue_green:.1f}°"
+    )
+
+
+def test_nicify_oklab_distinct_outputs_for_distinct_inputs():
+    """Two colors with clearly different dominant channels should produce
+    clearly different outputs, not collapse to similar-looking colors."""
+    blue_ish = (0x55, 0x66, 0x77)  # #556677 - dominant blue channel
+    green_ish = (0x55, 0x77, 0x66)  # #557766 - dominant green channel
+
+    result_blue = nicify_oklab(blue_ish)
+    result_green = nicify_oklab(green_ish)
+
+    # Outputs must be different
+    assert result_blue != result_green, "Distinct inputs should produce distinct outputs"
+
+    # The output hues should be far apart (these colors differ by ~105° in OkLab hue)
+    output_hue_blue = _oklab_hue(result_blue)
+    output_hue_green = _oklab_hue(result_green)
+    hue_diff = _hue_distance(output_hue_blue, output_hue_green)
+    assert hue_diff > 60, f"Output hues should remain well-separated, got only {hue_diff:.1f}° apart"
+
+
+def test_nicify_oklab_muted_input_not_oversaturated():
+    """A muted/desaturated input should not become maximally saturated.
+
+    #556677 has very low saturation (~0.17 in HLS). After nicification with
+    default params, it should remain moderate — not become fully saturated.
+    """
+    muted_color = (0x55, 0x66, 0x77)  # Low saturation input
+    result = nicify_oklab(muted_color)
+
+    sat = _hls_saturation(result)
+    # A muted input should not become fully saturated
+    assert sat < 0.95, f"Muted input ({muted_color}) became oversaturated: HLS S={sat:.3f}"
+
+
+def test_nicify_oklab_saturation_params_are_effective():
+    """The min_sat/max_sat parameters should meaningfully affect the output.
+
+    With low max_sat (neutral scheme), output should be less saturated than
+    with high min_sat (fluorescent scheme).
+    """
+    color = (200, 50, 50)  # A vivid red
+
+    result_neutral = nicify_oklab(color, min_sat=0.05, max_sat=0.1)
+    result_fluorescent = nicify_oklab(color, min_sat=0.7, max_sat=1.0)
+
+    sat_neutral = _hls_saturation(result_neutral)
+    sat_fluorescent = _hls_saturation(result_fluorescent)
+
+    # Neutral should be significantly less saturated
+    assert sat_neutral < sat_fluorescent, f"Neutral ({sat_neutral:.3f}) should be less saturated than fluorescent ({sat_fluorescent:.3f})"
+    # And the difference should be meaningful (not just rounding)
+    assert sat_fluorescent - sat_neutral > 0.15, (
+        f"Saturation difference too small: neutral={sat_neutral:.3f}, fluorescent={sat_fluorescent:.3f}"
+    )
+
+
+def test_nicify_oklab_chroma_not_always_capped():
+    """The output chroma should vary with input — not always be the same fixed value.
+
+    A nearly-grey input and a vivid input should produce different chroma levels.
+    """
+    grey_ish = (128, 128, 130)  # Almost grey
+    vivid = (255, 0, 0)  # Pure red
+
+    result_grey = nicify_oklab(grey_ish)
+    result_vivid = nicify_oklab(vivid)
+
+    sat_grey = _hls_saturation(result_grey)
+    sat_vivid = _hls_saturation(result_vivid)
+
+    # Both should be valid
+    assert 0 <= sat_grey <= 1.0
+    assert 0 <= sat_vivid <= 1.0
+
+    # The vivid input should produce higher saturation than the grey one
+    assert sat_vivid > sat_grey, f"Vivid input should be more saturated than grey: vivid={sat_vivid:.3f}, grey={sat_grey:.3f}"
+
+
+def test_nicify_oklab_user_reported_bug():
+    """Regression test for user-reported issue: pypr color #556677 and
+    pypr color #557766 should produce visually distinct palettes.
+
+    #556677 is blue-dominant and should yield a blue-ish primary.
+    #557766 is green-dominant and should yield a green-ish primary.
+    """
+    blue_ish = (0x55, 0x66, 0x77)
+    green_ish = (0x55, 0x77, 0x66)
+
+    result_blue = nicify_oklab(blue_ish)
+    result_green = nicify_oklab(green_ish)
+
+    # Blue-ish: the blue channel should be dominant in output
+    assert result_blue[2] > result_blue[1], (
+        f"#556677 output should have B > G: got RGB({result_blue[0]}, {result_blue[1]}, {result_blue[2]})"
+    )
+
+    # Green-ish: the green channel should be dominant in output
+    assert result_green[1] > result_green[2], (
+        f"#557766 output should have G > B: got RGB({result_green[0]}, {result_green[1]}, {result_green[2]})"
+    )
+
+
 # --- Theme / Existing Tests Preserved Below ---
 
 
@@ -281,7 +451,7 @@ def test_generate_palette_basic(wallpaper_plugin):
     rgb_list = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
     wallpaper_plugin.config = {}
 
-    palette = generate_palette(rgb_list, mock_process_color, theme="dark")
+    palette = generate_palette(rgb_list, mock_process_color, theme=Theme.DARK)
 
     assert palette["scheme"] == "dark"
     # Basic check for existence
@@ -403,3 +573,158 @@ def test_color_scheme_effect_on_saturation(wallpaper_plugin):
 
     # Confirm relative difference - this is the most important check for "greyer vs more saturated"
     assert s_neutral < s_fluo - 0.2, "Neutral scheme should be significantly less saturated than Fluo scheme"
+
+
+# --- Palette Display Tests ---
+
+
+from pyprland.plugins.wallpapers.palette import (
+    hex_to_rgb,
+    generate_sample_palette,
+    palette_to_json,
+    palette_to_terminal,
+    _categorize_palette,
+)
+import json
+
+
+def test_hex_to_rgb():
+    """Test hex color to RGB conversion."""
+    # With hash
+    assert hex_to_rgb("#FF0000") == (255, 0, 0)
+    assert hex_to_rgb("#00FF00") == (0, 255, 0)
+    assert hex_to_rgb("#0000FF") == (0, 0, 255)
+    assert hex_to_rgb("#4285F4") == (66, 133, 244)
+
+    # Without hash
+    assert hex_to_rgb("FF0000") == (255, 0, 0)
+    assert hex_to_rgb("4285F4") == (66, 133, 244)
+
+    # Lowercase
+    assert hex_to_rgb("#ff5500") == (255, 85, 0)
+
+
+def test_generate_sample_palette():
+    """Test sample palette generation."""
+    base_rgb = (66, 133, 244)  # Google blue
+    palette = generate_sample_palette(base_rgb, theme=Theme.DARK)
+
+    # Check that palette contains expected keys
+    assert "scheme" in palette
+    assert palette["scheme"] == "dark"
+
+    # Check color categories exist
+    assert "colors.primary.dark.hex" in palette
+    assert "colors.primary.light.hex" in palette
+    assert "colors.secondary.dark.hex" in palette
+    assert "colors.surface.dark.hex" in palette
+    assert "colors.error.dark.hex" in palette
+
+    # Check hex format
+    assert palette["colors.primary.dark.hex"].startswith("#")
+    assert len(palette["colors.primary.dark.hex"]) == 7
+
+    # Check other formats exist
+    assert "colors.primary.dark.rgb" in palette
+    assert "colors.primary.dark.rgba" in palette
+    assert "colors.primary.dark.hex_stripped" in palette
+
+    # hex_stripped should not have #
+    assert not palette["colors.primary.dark.hex_stripped"].startswith("#")
+
+
+def test_generate_sample_palette_light_theme():
+    """Test sample palette generation with light theme."""
+    base_rgb = (66, 133, 244)
+    palette = generate_sample_palette(base_rgb, theme=Theme.LIGHT)
+
+    assert palette["scheme"] == "light"
+    # Default should match light variant
+    assert palette["colors.primary"] == palette["colors.primary.light.hex"]
+
+
+def test_categorize_palette():
+    """Test palette categorization."""
+    # Create a minimal palette for testing
+    palette = {
+        "scheme": "dark",
+        "colors.primary.dark.hex": "#AABBCC",
+        "colors.secondary.dark.hex": "#DDEEFF",
+        "colors.surface.dark.hex": "#112233",
+        "colors.error.dark.hex": "#FF0000",
+        "colors.red.dark.hex": "#FF6666",
+        "colors.background.dark.hex": "#000000",
+    }
+
+    categories = _categorize_palette(palette)
+
+    assert "colors.primary.dark.hex" in categories["primary"]
+    assert "colors.secondary.dark.hex" in categories["secondary"]
+    assert "colors.surface.dark.hex" in categories["surface"]
+    assert "colors.error.dark.hex" in categories["error"]
+    assert "colors.red.dark.hex" in categories["ansi"]
+    assert "colors.background.dark.hex" in categories["utility"]
+
+
+def test_palette_to_json():
+    """Test JSON palette output."""
+    base_rgb = (255, 85, 0)  # Orange
+    palette = generate_sample_palette(base_rgb, theme=Theme.DARK)
+
+    json_output = palette_to_json(palette)
+
+    # Should be valid JSON
+    parsed = json.loads(json_output)
+
+    # Check structure
+    assert "variables" in parsed
+    assert "categories" in parsed
+    assert "filters" in parsed
+    assert "theme" in parsed
+
+    # Check variables
+    assert "colors.primary.dark.hex" in parsed["variables"]
+
+    # Check categories
+    assert "primary" in parsed["categories"]
+    assert "secondary" in parsed["categories"]
+    assert "ansi" in parsed["categories"]
+
+    # Check filters documentation
+    assert "set_alpha" in parsed["filters"]
+    assert "set_lightness" in parsed["filters"]
+    assert "example" in parsed["filters"]["set_alpha"]
+    assert "description" in parsed["filters"]["set_lightness"]
+
+    # Check theme
+    assert parsed["theme"] == "dark"
+
+
+def test_palette_to_terminal():
+    """Test terminal palette output."""
+    base_rgb = (66, 133, 244)
+    palette = generate_sample_palette(base_rgb, theme=Theme.DARK)
+
+    terminal_output = palette_to_terminal(palette)
+
+    # Should contain category headers
+    assert "Primary:" in terminal_output
+    assert "Secondary:" in terminal_output
+    assert "Surface:" in terminal_output
+    assert "Error:" in terminal_output
+    assert "ANSI Colors:" in terminal_output
+
+    # Should contain ANSI escape codes (24-bit color)
+    assert "\033[48;2;" in terminal_output
+    assert "\033[0m" in terminal_output
+
+    # Should contain variable names
+    assert "colors.primary.dark.hex" in terminal_output
+
+    # Should contain hex values
+    assert "#" in terminal_output
+
+    # Should contain filter examples
+    assert "Filters:" in terminal_output
+    assert "set_alpha" in terminal_output
+    assert "set_lightness" in terminal_output

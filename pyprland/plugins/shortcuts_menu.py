@@ -5,6 +5,7 @@ from typing import cast
 
 from ..adapters.menus import MenuMixin
 from ..common import apply_filter, apply_variables
+from ..process import create_subprocess
 from ..validation import ConfigField, ConfigItems
 from .interface import Plugin
 
@@ -13,14 +14,14 @@ class Extension(MenuMixin, Plugin):
     """A flexible way to make your own shortcuts menus & launchers."""
 
     config_schema = ConfigItems(
-        ConfigField("entries", dict, required=True, description="Menu entries structure (nested dict of commands)"),
+        ConfigField("entries", dict, required=True, description="Menu entries structure (nested dict of commands)", category="basic"),
         *MenuMixin.menu_config_schema,
-        ConfigField("separator", str, default=" | ", description="Separator for menu display"),
-        ConfigField("command_start", str, default="", description="Prefix for command entries"),
-        ConfigField("command_end", str, default="", description="Suffix for command entries"),
-        ConfigField("submenu_start", str, default="", description="Prefix for submenu entries"),
-        ConfigField("submenu_end", str, default="➜", description="Suffix for submenu entries"),
-        ConfigField("skip_single", bool, default=True, description="Auto-select when only one option available"),
+        ConfigField("separator", str, default=" | ", description="Separator for menu display", category="appearance"),
+        ConfigField("command_start", str, default="", description="Prefix for command entries", category="appearance"),
+        ConfigField("command_end", str, default="", description="Suffix for command entries", category="appearance"),
+        ConfigField("submenu_start", str, default="", description="Prefix for submenu entries", category="appearance"),
+        ConfigField("submenu_end", str, default="➜", description="Suffix for submenu entries", category="appearance"),
+        ConfigField("skip_single", bool, default=True, description="Auto-select when only one option available", category="behavior"),
     )
 
     # Commands
@@ -86,14 +87,14 @@ class Extension(MenuMixin, Plugin):
                 choices = []
                 var_name = option["name"]
                 if option.get("command"):  # use the option to select some variable
-                    proc = await asyncio.create_subprocess_shell(option["command"], stdout=asyncio.subprocess.PIPE)
+                    proc = await create_subprocess(option["command"], stdout=asyncio.subprocess.PIPE)
                     assert proc.stdout
                     await proc.wait()
                     option_array = (await proc.stdout.read()).decode().split("\n")
                     choices.extend([apply_variables(line, variables).strip() for line in option_array if line.strip()])
                 elif option.get("options"):
                     choices.extend(apply_variables(txt, variables) for txt in option["options"])
-                if len(choices) == 0:
+                if not choices:
                     await self.backend.notify_info("command didn't return anything")
                     return
 
@@ -115,4 +116,4 @@ class Extension(MenuMixin, Plugin):
         """
         final_command = apply_variables(command, variables)
         self.log.info("Executing %s", final_command)
-        await asyncio.create_subprocess_shell(final_command)
+        await create_subprocess(final_command)

@@ -4,7 +4,8 @@ __all__ = ["Scratch"]
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from itertools import count
+from typing import TYPE_CHECKING, Any, Protocol
 
 from ...aioops import aiexists, aiopen
 from ...models import ClientInfo, MonitorInfo, VersionInfo
@@ -25,9 +26,12 @@ if TYPE_CHECKING:
             self,
             match_fn: Callable = ...,
             clients: list[ClientInfo] | None = None,
-            **kw: Any,  # noqa: ANN401
+            **kw: Any,
         ) -> ClientInfo | None:
             pass
+
+
+CLIENT_INFO_RETRY_COUNT = 5
 
 
 @dataclass
@@ -39,15 +43,16 @@ class MetaInfo:
     no_pid: bool = False
     last_shown: float | int = 0
     space_identifier: tuple[str, str] = ("", "")
-    monitor_info: MonitorInfo = None  # type: ignore
+    monitor_info: MonitorInfo | None = None
     extra_positions: dict[str, tuple[int, int]] = field(default_factory=dict)
+    saved_size: dict[str, tuple[int, int]] = field(default_factory=dict)
 
 
 class Scratch:  # {{{
     """A scratchpad state including configuration & client state."""
 
     # get_client_props: "ClientPropGetter"
-    client_info: ClientInfo
+    client_info: ClientInfo | None
     visible = False
     uid = ""
     monitor = ""
@@ -65,7 +70,7 @@ class Scratch:  # {{{
         self.ctx = PluginContext(plugin.log, plugin.state, plugin.backend)
         self.uid = uid
         self.set_config(full_config)
-        self.client_info: ClientInfo = {}  # type: ignore
+        self.client_info: ClientInfo | None = None
         self.meta = MetaInfo()
         self.extra_addr: set[str] = set()  # additional client addresses
         self.excluded_scratches: list[str] = []
@@ -73,9 +78,9 @@ class Scratch:  # {{{
     @property
     def forced_monitor(self) -> str | None:
         """Returns forced monitor if available, else None."""
-        forced_monitor = self.conf.get("force_monitor")
-        if forced_monitor in self.ctx.state.active_monitors:
-            return cast("str", forced_monitor)
+        forced_monitor = self.conf.get_str("force_monitor")
+        if forced_monitor and forced_monitor in self.ctx.state.active_monitors:
+            return forced_monitor
         return None
 
     @property
@@ -128,7 +133,7 @@ class Scratch:  # {{{
         if self.conf.get_bool("close_on_hide"):
             self.conf["lazy"] = True
         if self.ctx.state.hyprland_version < VersionInfo(0, 39, 0):
-            self.conf["allow_special_workspace"] = False
+            self.conf["allow_special_workspaces"] = False
 
     def have_address(self, addr: str) -> bool:
         """Check if the address is the same as the client.
@@ -161,7 +166,6 @@ class Scratch:  # {{{
                 raise RuntimeError(msg)
             self.client_info = m_client
         await ex.backend.execute(f"movetoworkspacesilent {mk_scratch_name(self.uid)},address:{self.full_address}")
-        await asyncio.sleep(0.05)  # workaround
         self.meta.initialized = True
 
     async def is_alive(self) -> bool:
@@ -198,10 +202,14 @@ class Scratch:  # {{{
 
     def get_match_props(self) -> tuple[str, str | float]:
         """Return the match properties for the scratchpad."""
-        match_by = cast("str", self.conf.get("match_by"))
+        match_by = self.conf.get_str("match_by")
         if match_by == "pid":
             return match_by, self.pid
-        return match_by, cast("str | float", self.conf[match_by])
+        # Dynamic key access - the match_by value (e.g., "class", "title") is used as a key
+        match_value = self.conf.get(match_by)
+        if match_value is None:
+            return match_by, ""
+        return match_by, str(match_value) if not isinstance(match_value, (int, float)) else match_value
 
     def reset(self, pid: int) -> None:
         """Clear the object.
@@ -211,18 +219,29 @@ class Scratch:  # {{{
         """
         self.pid = pid
         self.visible = False
-        self.client_info = {}  # type: ignore
+        self.client_info = None
         self.meta.initialized = False
+        self.meta.extra_positions.clear()
+        self.meta.saved_size.clear()
+
+    @property
+    def client_ready(self) -> bool:
+        """Check if the client info is available and contains size information."""
+        return bool(self.client_info is not None and "size" in self.client_info)
 
     @property
     def address(self) -> str:
-        """Return the client address."""
+        """Return the client address (without 0x prefix)."""
+        if self.client_info is None:
+            return ""
         return self.client_info.get("address", "")[2:]
 
     @property
     def full_address(self) -> str:
         """Return the client address."""
-        return cast("str", self.client_info.get("address", ""))
+        if self.client_info is None:
+            return ""
+        return self.client_info.get("address", "")
 
     async def update_client_info(
         self,
@@ -236,17 +255,22 @@ class Scratch:  # {{{
             clients: The list of clients
         """
         if client_info is None:
-            if self.have_command:
-                client_info = await self.ctx.backend.get_client_props(addr=self.full_address, clients=clients)
-            else:
-                client_info = await self.fetch_matching_client(clients=clients)
+            counter = count(0)
+            while next(counter) < CLIENT_INFO_RETRY_COUNT:
+                if self.have_command:
+                    client_info = await self.ctx.backend.get_client_props(addr=self.full_address, clients=clients)
+                else:
+                    client_info = await self.fetch_matching_client(clients=clients)
+                if client_info and client_info["mapped"]:
+                    break
+                await asyncio.sleep(0.1)  # wait a bit before retrying
 
         if client_info is None:
             self.ctx.log.error("The client window %s vanished", self.full_address)
             msg = f"Client window {self.full_address} not found"
             raise KeyError(msg)
 
-        self.client_info.update(client_info)
+        self.client_info = client_info
 
     def event_workspace(self, name: str) -> None:
         """Check if the workspace changed.

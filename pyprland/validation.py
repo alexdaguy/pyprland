@@ -1,10 +1,20 @@
-"""Configuration validation framework."""
+"""Configuration validation framework with schema definitions.
+
+Provides declarative schema definitions (ConfigField, ConfigItems) for
+validating plugin configuration. Supports type checking, required fields,
+choices, nested dict validation, and fuzzy matching for typo detection.
+
+Used by:
+- Plugin.validate_config() for runtime validation
+- 'pypr validate' CLI for static configuration checking
+- TUI editor for configuration field metadata
+"""
 
 import difflib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, cast, get_args, get_origin
 
 from .config import BOOL_STRINGS
 
@@ -16,7 +26,7 @@ __all__ = [
 
 
 @dataclass
-class ConfigField:
+class ConfigField:  # pylint: disable=too-many-instance-attributes
     """Describes an expected configuration field for validation.
 
     Attributes:
@@ -27,6 +37,13 @@ class ConfigField:
         default: Default value if not provided
         description: Human-readable description for error messages
         choices: List of valid values for enum-like fields
+        validator: Custom validator function returning list of error messages
+        children: Schema for validating dict values (when field_type is dict).
+                  Supports arbitrary nesting depth - children schemas can themselves
+                  have children with their own schemas.
+        children_allow_extra: If True, don't warn about unknown keys in children
+        category: UI grouping category for TUI display (e.g., "basic", "positioning", "behavior")
+        is_directory: For Path types, True means directory path, False means file path
     """
 
     name: str
@@ -37,19 +54,34 @@ class ConfigField:
     description: str = ""
     choices: list | None = None
     validator: Callable[[Any], list[str]] | None = None
+    children: "ConfigItems | None" = None
+    children_allow_extra: bool = False
+    category: str = ""  # UI grouping category (e.g., "basic", "positioning", "behavior")
+    is_directory: bool = False  # For Path types: True = directory, False = file
 
     @property
     def type_name(self) -> str:
-        """Return human-readable type name (e.g., 'str', 'int or str')."""
+        """Return human-readable type name (e.g., 'str', 'list[Path]')."""
+
+        def _format_type(typ: type) -> str:
+            origin = get_origin(typ)
+            if origin is not None:
+                args = get_args(typ)
+                if args:
+                    args_str = ", ".join(_format_type(a) for a in args)
+                    return f"{origin.__name__}[{args_str}]"
+                return str(origin.__name__)
+            return str(typ.__name__)
+
         if isinstance(self.field_type, tuple):
-            return " or ".join(t.__name__ for t in self.field_type)
-        return self.field_type.__name__
+            return " or ".join(_format_type(typ) for typ in self.field_type)
+        return _format_type(self.field_type)
 
 
 class ConfigItems(list):
     """A list of ConfigField items with cached lookup by name."""
 
-    def __init__(self, *args: ConfigField):
+    def __init__(self, *args: ConfigField) -> None:
         super().__init__(args)
         self._cache: dict[str, ConfigField] = {}
 
@@ -109,7 +141,7 @@ def format_config_error(plugin: str, field: str, message: str, suggestion: str =
 class ConfigValidator:
     """Validates configuration against a schema."""
 
-    def __init__(self, config: dict, plugin_name: str, logger: logging.Logger):
+    def __init__(self, config: dict, plugin_name: str, logger: logging.Logger) -> None:
         """Initialize the validator.
 
         Args:
@@ -182,7 +214,7 @@ class ConfigValidator:
 
         return errors
 
-    def _check_type(self, field_def: ConfigField, value: Any) -> str | None:  # noqa: ANN401
+    def _check_type(self, field_def: ConfigField, value: Any) -> str | None:
         """Check if value matches expected type.
 
         Args:
@@ -216,8 +248,8 @@ class ConfigValidator:
     def _check_union_type(
         self,
         field_def: ConfigField,
-        value: Any,  # noqa: ANN401
-        expected_types: tuple,  # noqa: ANN401
+        value: Any,
+        expected_types: tuple,
     ) -> str | None:
         """Check if value matches any of the union types."""
         for single_type in expected_types:
@@ -230,7 +262,7 @@ class ConfigValidator:
             f"Expected {field_def.type_name}, got {type(value).__name__}",
         )
 
-    def _check_bool(self, field_def: ConfigField, value: Any) -> str | None:  # noqa: ANN401
+    def _check_bool(self, field_def: ConfigField, value: Any) -> str | None:
         """Check bool type (special handling since bool is subclass of int)."""
         if isinstance(value, bool):
             return None
@@ -243,7 +275,7 @@ class ConfigValidator:
             "Use true/false (without quotes)",
         )
 
-    def _check_numeric(self, field_def: ConfigField, value: Any) -> str | None:  # noqa: ANN401
+    def _check_numeric(self, field_def: ConfigField, value: Any) -> str | None:
         """Check int/float type."""
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             return None
@@ -260,7 +292,7 @@ class ConfigValidator:
 
         return None
 
-    def _check_str(self, field_def: ConfigField, value: Any) -> str | None:  # noqa: ANN401
+    def _check_str(self, field_def: ConfigField, value: Any) -> str | None:
         """Check str type."""
         if isinstance(value, str):
             return None
@@ -271,7 +303,7 @@ class ConfigValidator:
             f'Use {field_def.name} = "value"',
         )
 
-    def _check_list(self, field_def: ConfigField, value: Any) -> str | None:  # noqa: ANN401
+    def _check_list(self, field_def: ConfigField, value: Any) -> str | None:
         """Check list type."""
         if isinstance(value, list):
             return None
@@ -282,15 +314,58 @@ class ConfigValidator:
             f'Use {field_def.name} = ["item1", "item2"]',
         )
 
-    def _check_dict(self, field_def: ConfigField, value: Any) -> str | None:  # noqa: ANN401
-        """Check dict type."""
-        if isinstance(value, dict):
-            return None
-        return format_config_error(
-            self.plugin_name,
-            field_def.name,
-            f"Expected dict/section, got {type(value).__name__}",
-        )
+    def _check_dict(self, field_def: ConfigField, value: Any) -> str | None:
+        """Check dict type and optionally validate children."""
+        if not isinstance(value, dict):
+            return format_config_error(
+                self.plugin_name,
+                field_def.name,
+                f"Expected dict/section, got {type(value).__name__}",
+            )
+
+        # Validate children schema if defined
+        if field_def.children is not None:
+            child_errors = self._validate_dict_children(field_def, value)
+            if child_errors:
+                return "\n".join(child_errors)
+
+        return None
+
+    def _validate_dict_children(
+        self,
+        field_def: ConfigField,
+        value: dict,
+    ) -> list[str]:
+        """Validate all children in a dict against the children schema.
+
+        Args:
+            field_def: Field definition with children schema
+            value: Dict value to validate
+
+        Returns:
+            List of all validation errors
+        """
+        errors: list[str] = []
+        children_schema = cast("ConfigItems", field_def.children)
+        for key, child_value in value.items():
+            if not isinstance(child_value, dict):
+                errors.append(
+                    format_config_error(
+                        f"{self.plugin_name}.{field_def.name}",
+                        key,
+                        f"Expected dict, got {type(child_value).__name__}",
+                    )
+                )
+                continue
+
+            child_prefix = f"{self.plugin_name}.{field_def.name}.{key}"
+            child_validator = ConfigValidator(child_value, child_prefix, self.log)
+            errors.extend(child_validator.validate(children_schema))
+            # Only warn about unknown keys if not allowing extra keys
+            if not field_def.children_allow_extra:
+                errors.extend(child_validator.warn_unknown_keys(children_schema))
+
+        return errors
 
     def _get_required_suggestion(self, field_def: ConfigField) -> str:
         """Generate suggestion for a missing required field.

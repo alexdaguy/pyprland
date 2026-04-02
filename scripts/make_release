@@ -31,7 +31,12 @@ git commit -m "Version $version"  --no-verify
 git tag $version
 git push
 
-poetry publish --build -u $PYPI_USERNAME -p $PYPI_PASSWORD
+rm -fr dist
+# Build sdist + pure Python wheel
+uv build
+# Build platform-specific wheel with statically compiled C client
+PYPRLAND_BUILD_NATIVE=1 uv build --wheel
+uv publish -u $PYPI_USERNAME -p $PYPI_PASSWORD
 # }}}
 
 # Make the release
@@ -71,6 +76,7 @@ pushd ../aurPkgs/pyprland/
 echo $version | bumpAurPkg.sh
 popd
 
+echo "" >RELEASE_NOTES.md
 exit 0
 # Upload the standalone version
 

@@ -1,4 +1,15 @@
-"""Interact with hyprland using sockets."""
+"""IPC communication with Hyprland and Niri compositors.
+
+Provides async context managers for socket connections and request/response
+handling. Includes retry logic for transient connection issues and event
+stream support for compositor events.
+
+Key exports:
+- hyprctl_connection: Context manager for Hyprland IPC
+- niri_connection: Context manager for Niri IPC
+- get_response: Send command and receive JSON response
+- get_event_stream: Open persistent event stream connection
+"""
 
 __all__ = [
     "get_response",
@@ -14,7 +25,7 @@ import os
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from logging import Logger
-from typing import Any
+from typing import Any, cast
 
 from .common import IPC_FOLDER, get_logger
 from .constants import IPC_MAX_RETRIES, IPC_RETRY_DELAY_MULTIPLIER
@@ -115,7 +126,7 @@ def retry_on_reset(func: Callable) -> Callable:
         func: The function to wrap
     """
 
-    async def wrapper(*args, log: Logger | None = None, logger: Logger | None = None, **kwargs) -> Any:  # noqa: ANN401
+    async def wrapper(*args, log: Logger | None = None, logger: Logger | None = None, **kwargs) -> Any:
         # Support both 'log' and 'logger' parameter names
         effective_log = log or logger
         if effective_log is None and args and hasattr(args[0], "log"):
@@ -128,7 +139,7 @@ def retry_on_reset(func: Callable) -> Callable:
                 if "log" in func.__code__.co_varnames:
                     return await func(*args, **kwargs, log=effective_log)
                 return await func(*args, **kwargs, logger=effective_log)
-            except ConnectionResetError as e:  # noqa: PERF203
+            except ConnectionResetError as e:
                 exc = e
                 effective_log.warning("ipc connection problem, retrying...")
                 await asyncio.sleep(IPC_RETRY_DELAY_MULTIPLIER * count)
@@ -148,7 +159,7 @@ async def niri_request(payload: str | dict | list, logger: Logger) -> JSONRespon
         if not response:
             msg = "Empty response from Niri"
             raise PyprError(msg)
-        return json.loads(response)  # type: ignore
+        return cast("JSONResponse", json.loads(response))
 
 
 async def get_response(command: bytes, logger: Logger) -> JSONResponse:
@@ -164,7 +175,7 @@ async def get_response(command: bytes, logger: Logger) -> JSONResponse:
         reader_data = await reader.read()
 
     decoded_data = reader_data.decode("utf-8", errors="replace")
-    return json.loads(decoded_data)  # type: ignore
+    return cast("JSONResponse", json.loads(decoded_data))
 
 
 def init() -> None:

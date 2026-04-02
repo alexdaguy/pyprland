@@ -1,7 +1,20 @@
-"""Common types from Hyprland API."""
+"""Type definitions and data models for Pyprland.
+
+Provides TypedDict definitions matching Hyprland's JSON API responses:
+- ClientInfo: Window/client properties
+- MonitorInfo: Monitor/output properties
+- WorkspaceDf: Workspace identifier
+
+Also includes:
+- Environment: Supported compositor/display server types
+- ResponsePrefix: Protocol constants for daemon-client communication
+- ExitCode: Standard CLI exit codes
+- ReloadReason: Context for plugin on_reload() calls
+- PyprError: Base exception for logged errors
+"""
 
 from dataclasses import dataclass
-from enum import Enum, IntEnum, StrEnum
+from enum import Enum, IntEnum, StrEnum, auto
 from typing import TypedDict
 
 PlainTypes = float | str | dict[str, "PlainTypes"] | list["PlainTypes"]
@@ -22,30 +35,33 @@ class WorkspaceDf(TypedDict):
     name: str
 
 
-class ClientInfo(TypedDict):
-    """Client information as returned by Hyprland."""
-
-    address: str
-    mapped: bool
-    hidden: bool
-    at: tuple[int, int]
-    size: tuple[int, int]
-    workspace: WorkspaceDf
-    floating: bool
-    monitor: int
-    class_: str
-    title: str
-    initialClass: str
-    initialTitle: str
-    pid: int
-    xwayland: bool
-    pinned: bool
-    fullscreen: bool
-    fullscreenMode: int
-    fakeFullscreen: bool
-    grouped: list[str]
-    swallowing: str
-    focusHistoryID: int
+ClientInfo = TypedDict(
+    "ClientInfo",
+    {
+        "address": str,
+        "mapped": bool,
+        "hidden": bool,
+        "at": tuple[int, int],
+        "size": tuple[int, int],
+        "workspace": WorkspaceDf,
+        "floating": bool,
+        "monitor": int,
+        "class": str,
+        "title": str,
+        "initialClass": str,
+        "initialTitle": str,
+        "pid": int,
+        "xwayland": bool,
+        "pinned": bool,
+        "fullscreen": bool,
+        "fullscreenMode": int,
+        "fakeFullscreen": bool,
+        "grouped": list[str],
+        "swallowing": str,
+        "focusHistoryID": int,
+    },
+)
+"""Client information as returned by Hyprland."""
 
 
 class MonitorInfo(TypedDict):
@@ -108,3 +124,30 @@ class ResponsePrefix(StrEnum):
 
     OK = "OK"
     ERROR = "ERROR"
+
+
+class ReloadReason(Enum):
+    """Reason for plugin reload/reconfiguration.
+
+    Allows plugins to optimize behavior based on reload context:
+    - INIT: First load during daemon startup (after init())
+    - RELOAD: Configuration reload (pypr reload, pypr set, or plugin self-restart)
+    """
+
+    INIT = auto()
+    RELOAD = auto()
+
+
+class Environment(StrEnum):
+    """Supported compositor/display server environments.
+
+    Used for:
+    - Plugin compatibility filtering (Plugin.environments)
+    - Runtime environment detection (SharedState.environment)
+    - Quickstart wizard environment selection
+    """
+
+    HYPRLAND = "hyprland"
+    NIRI = "niri"
+    WAYLAND = "wayland"  # Generic Wayland (no specific compositor)
+    XORG = "xorg"  # X11/Xorg fallback

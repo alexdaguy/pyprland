@@ -4,41 +4,59 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from pyprland.builtin_commands import BUILTIN_COMMANDS
+from .commands.discovery import get_all_commands
+from .commands.parsing import normalize_command_name
+from .commands.tree import build_command_tree, get_display_name, get_parent_prefixes
 
 if TYPE_CHECKING:
-    from pyprland.manager import Pyprland
+    from .manager import Pyprland
 
-__all__ = ["BUILTIN_COMMANDS", "get_commands_help", "get_help", "get_command_help"]
+__all__ = ["get_command_help", "get_commands_help", "get_help"]
 
 
-def get_commands_help(manager: Pyprland) -> dict[str, str]:
+def get_commands_help(manager: Pyprland) -> dict[str, tuple[str, str]]:
     """Get the available commands and their short documentation.
+
+    Uses command tree to show parent commands with their subcommands.
+    Example: "wall" -> ("<next|pause|clear|rm|cleanup>", "wallpapers")
 
     Args:
         manager: The Pyprland manager instance
 
     Returns:
-        Dict mapping command name to short description
+        Dict mapping command name to (short_description, source) tuple
     """
-    # Start with built-in commands (use short description)
-    docs = {cmd: info[0] for cmd, info in BUILTIN_COMMANDS.items()}
+    all_commands = get_all_commands(manager)
+    command_tree = build_command_tree(all_commands)
 
-    # Add plugin commands
-    for plug in manager.plugins.values():
-        for name in dir(plug):
-            if not name.startswith("run_"):
-                continue
-            fn = getattr(plug, name)
-            if callable(fn):
-                doc_txt = fn.__doc__ or "N/A"
-                first_line = doc_txt.split("\n", 1)[0]  # Use first line only
-                docs[name[4:]] = f"{first_line} [{plug.name}]"
-    return docs
+    result: dict[str, tuple[str, str]] = {}
+
+    for root_name, node in sorted(command_tree.items()):
+        if node.children:
+            # Command with subcommands - show inline
+            subcmds = "|".join(sorted(node.children.keys()))
+            # Get source from first child with info, or from parent
+            source = ""
+            for child in node.children.values():
+                if child.info:
+                    source = child.info.source
+                    break
+            if not source and node.info:
+                source = node.info.source
+            desc = node.info.short_description if node.info else ""
+            result[root_name] = (f"<{subcmds}> {desc}".strip(), source)
+        elif node.info:
+            # Regular command
+            result[root_name] = (node.info.short_description, node.info.source)
+
+    return result
 
 
 def get_help(manager: Pyprland) -> str:
     """Get the help documentation for all commands.
+
+    Commands are grouped by plugin, with built-in commands listed first.
+    Client-only commands (pypr only, not pypr-client) are marked with *.
 
     Args:
         manager: The Pyprland manager instance
@@ -49,33 +67,88 @@ If the command is omitted, runs the daemon which will start every configured plu
 
 Available commands:
 """
-    return intro + "\n".join(f" {name:20s} {doc}" for name, doc in get_commands_help(manager).items())
+    commands_help = get_commands_help(manager)
+
+    # Group by source (plugin), merging "client" into "built-in"
+    by_source: dict[str, list[tuple[str, str, bool]]] = {}
+    for name, (desc, source) in commands_help.items():
+        # Mark client commands and merge into built-in
+        is_pypr_only = source == "client"
+        group = "built-in" if source in ("built-in", "client") else source
+        by_source.setdefault(group, []).append((name, desc, is_pypr_only))
+
+    # Build output grouped by source, built-in first
+    lines: list[str] = []
+    sources = sorted(by_source.keys(), key=lambda s: (s != "built-in", s))
+
+    for source in sources:
+        # Header with pypr-only note for built-in
+        if source == "built-in":
+            lines.append(f"\n{source} (* = pypr only):")
+        else:
+            lines.append(f"\n{source}:")
+
+        # Sort commands: regular first, then pypr-only
+        cmds = sorted(by_source[source], key=lambda x: (x[2], x[0]))
+        for name, desc, is_pypr_only in cmds:
+            prefix = "* " if is_pypr_only else "  "
+            lines.append(f"{prefix}{name:20s} {desc}")
+
+    return intro + "\n".join(lines)
 
 
 def get_command_help(manager: Pyprland, command: str) -> str:
     """Get detailed help for a specific command.
 
+    Supports space-separated subcommands: "wall next" -> looks up "wall_next"
+    For parent commands with subcommands, shows list of subcommands.
+
     Args:
         manager: The Pyprland manager instance
-        command: Command name to get help for
+        command: Command name to get help for (may contain spaces for subcommands)
 
     Returns:
-        Full docstring with plugin name, or error message if not found
+        Full docstring with source indicator, or error message if not found
     """
-    # Normalize command name (support dashes)
-    command = command.replace("-", "_")
+    # Handle space-separated subcommands: "wall next" -> "wall_next"
+    command = normalize_command_name(command)
+    all_commands = get_all_commands(manager)
+    command_tree = build_command_tree(all_commands)
+    parent_prefixes = get_parent_prefixes({name: info.source for name, info in all_commands.items()})
 
-    # Check built-in commands first
-    if command in BUILTIN_COMMANDS:
-        short, detail, _ = BUILTIN_COMMANDS[command]
-        full_doc = f"{short}\n\n{detail}" if detail else short
-        return f"{command}\n\n{full_doc}\n"
+    # Try direct lookup first (e.g., "wall_next" or "toggle")
+    if command in all_commands:
+        cmd = all_commands[command]
+        doc = cmd.full_description
+        doc_formatted = doc if doc.endswith("\n") else f"{doc}\n"
+        display_name = get_display_name(command, parent_prefixes)
+        return f"{display_name} ({cmd.source})\n\n{doc_formatted}"
 
-    # Search plugins for run_{command}
-    for plugin in manager.plugins.values():
-        method = getattr(plugin, f"run_{command}", None)
-        if method and callable(method):
-            doc = method.__doc__ or "No documentation available."
-            return f"{command} [{plugin.name}]\n\n{doc}" if doc.endswith("\n") else f"{command} [{plugin.name}]\n\n{doc}\n"
+    # Check if this is a parent command with subcommands
+    if command in command_tree:
+        node = command_tree[command]
+        if node.children:
+            # Show subcommands
+            # Get source from parent info, or first child with info
+            source = node.info.source if node.info else ""
+            if not source:
+                for child in node.children.values():
+                    if child.info:
+                        source = child.info.source
+                        break
+            lines = [f"{command} ({source or 'unknown'})", ""]
+
+            if node.info and node.info.full_description:
+                lines.append(node.info.full_description)
+                lines.append("")
+
+            lines.append("Subcommands:")
+            for subcmd_name, subcmd_node in sorted(node.children.items()):
+                if subcmd_node.info:
+                    lines.append(f"  {subcmd_name:15s} {subcmd_node.info.short_description}")
+                else:
+                    lines.append(f"  {subcmd_name}")
+            lines.append("")
+            return "\n".join(lines)
 
     return f"Unknown command: {command}\nRun 'pypr help' for available commands.\n"

@@ -1,55 +1,66 @@
-pyenv := ".tox/py314-linting"
-testenv := ".tox/py314-unit"
+# Run tests quickly
+quicktest:
+    uv run pytest -q tests
 
 # Run pytest with optional parameters
-test *params='tests':
-    {{testenv}}/bin/pytest --pdb -s {{params}}
-
-shorttest:
-    {{testenv}}/bin/pytest -q
-
-# Run all checks: unit tests, linting, and wiki generation
-all:
-    tox run -e unit,linting,wiki
+debug *params='tests':
+    uv run pytest --pdb -s {{params}}
 
 # Start the documentation website in dev mode
-website:
+website: gendoc
     npm i
     npm run docs:dev
 
 # Run linting and dead code detection
 lint:
-    tox run -e linting,deadcode
+    uv run mypy --install-types --non-interactive --check-untyped-defs pyprland
+    uv run ruff format pyprland
+    uv run ruff check --fix pyprland
+    uv run pylint -E pyprland
+    uv run flake8 pyprland
+    uv run vulture --ignore-names 'event_*,run_*,fromtop,frombottom,fromleft,fromright,instance' pyprland scripts/v_whitelist.py
 
 # Run version registry checks
 vreg:
-    tox run -e vreg
+    uv run --group vreg ./tests/vreg/run_tests.sh
 
 # Build documentation
 doc:
-    tox run -e doc
+    uv run pdoc --docformat google ./pyprland
 
 # Generate wiki pages
 wiki:
-    tox run -e wiki
+    ./scripts/generate_plugin_docs.py
+    ./scripts/check_plugin_docs.py
 
 # Generate plugin documentation from source
 gendoc:
     python scripts/generate_plugin_docs.py
 
+# Generate codebase overview from module docstrings
+overview:
+    python scripts/generate_codebase_overview.py
+
+# Archive documentation for a specific version (creates static snapshot)
+archive-docs version:
+    cd site && ./make_version.sh {{version}}
+
 # Create a new release
 release:
+    uv lock --upgrade
+    git add uv.lock
     ./scripts/make_release
 
 # Generate and open HTML coverage report
 htmlcov:
-    tox run -e coverage
-    {{pyenv}}/bin/coverage html
+    uv run coverage run --source=pyprland -m pytest tests -q
+    uv run coverage html
+    uv run coverage report
     xdg-open ./htmlcov/index.html
 
 # Run mypy type checks on pyprland
 types:
-    {{pyenv}}/bin/mypy --check-untyped-defs pyprland
+    uv run mypy --check-untyped-defs pyprland
 
 # Build C client - release (~17K)
 compile-c-client:
@@ -76,3 +87,16 @@ compile-rust-client-simple:
 # Build Rust client via rustc - debug
 compile-rust-client-simple-debug:
     rustc client/pypr-client.rs -o client/pypr-client
+
+# Build GUI frontend static assets
+gui-build:
+    cd pyprland/gui/frontend && npm install && npm run build
+
+# Start GUI frontend dev server (hot-reload) + backend API server
+gui-dev:
+    cd pyprland/gui/frontend && npm install && npm run dev &
+    uv run pypr-gui --port 8099 --no-browser
+
+# Launch the GUI (production mode — serves pre-built frontend)
+gui *args='':
+    uv run pypr-gui {{args}}

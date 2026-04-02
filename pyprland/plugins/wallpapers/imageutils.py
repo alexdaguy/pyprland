@@ -1,14 +1,21 @@
 """Image utilities for the wallpapers plugin."""
 
+from __future__ import annotations
+
 import colorsys
+import hashlib
 import os
-import os.path
-from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from ...aioops import ailistdir
+from ...aioops import aiisdir, ailistdir
 from .colorutils import Image, ImageDraw, ImageOps
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from .cache import ImageCache
 
 IMAGE_FORMAT = "jpg"
 
@@ -19,24 +26,31 @@ def expand_path(path: str) -> str:
     Args:
         path: The path to expand (handles ~ and environment variables)
     """
-    return os.path.expanduser(os.path.expandvars(path))
+    return str(Path(os.path.expandvars(path)).expanduser())
 
 
-async def get_files_with_ext(path: str, extensions: list[str], recurse: bool = True) -> AsyncIterator[str]:
+async def get_files_with_ext(
+    path: str,
+    extensions: list[str],
+    recurse: bool = True,
+    exclude_dirs: set[str] | None = None,
+) -> AsyncIterator[str]:
     """Return files matching `extension` in given `path`. Can optionally `recurse` subfolders..
 
     Args:
         path: Directory to search in
         extensions: List of file extensions to include
         recurse: Whether to search recursively in subdirectories
+        exclude_dirs: Set of directory names to skip when recursing
     """
+    exclude = exclude_dirs or set()
     for fname in await ailistdir(path):
         ext = fname.rsplit(".", 1)[-1]
         full_path = f"{path}/{fname}"
         if ext.lower() in extensions:
             yield full_path
-        elif recurse and os.path.isdir(full_path):
-            async for v in get_files_with_ext(full_path, extensions, True):
+        elif recurse and await aiisdir(full_path) and fname not in exclude:
+            async for v in get_files_with_ext(full_path, extensions, True, exclude_dirs):
                 yield v
 
 
@@ -51,36 +65,76 @@ class MonitorInfo:
     scale: float
 
 
+def get_effective_dimensions(monitor: MonitorInfo) -> tuple[int, int]:
+    """Get effective dimensions accounting for rotation.
+
+    Hyprland reports physical panel dimensions regardless of rotation.
+    Transforms 1, 3, 5, 7 are 90°/270° rotations that swap width/height.
+
+    Args:
+        monitor: Monitor info with width, height, and transform.
+
+    Returns:
+        Tuple of (effective_width, effective_height) after applying transform.
+    """
+    w, h = monitor.width, monitor.height
+    if monitor.transform in {1, 3, 5, 7}:
+        return h, w
+    return w, h
+
+
 class RoundedImageManager:
     """Manages rounded and scaled images for monitors."""
 
-    def __init__(self, radius: int) -> None:
+    def __init__(self, radius: int, cache: ImageCache) -> None:
         """Initialize the manager.
 
         Args:
             radius: Corner radius for rounding
+            cache: ImageCache instance for caching rounded images
         """
         self.radius = radius
+        self.cache = cache
 
-        self.tmpdir = Path("~").expanduser() / ".cache" / "pyprland" / "wallpapers"
-        self.tmpdir.mkdir(parents=True, exist_ok=True)
+    def hash_source(self, image_path: str) -> str:
+        """Generate a hash of the source image path.
 
-    def _build_key(self, monitor: MonitorInfo, image_path: str) -> str:
+        Args:
+            image_path: Path to the source image.
+
+        Returns:
+            First 16 characters of SHA256 hash.
+        """
+        return hashlib.sha256(image_path.encode()).hexdigest()[:16]
+
+    def _hash_settings(self, monitor: MonitorInfo) -> str:
+        """Generate a hash of the monitor/radius settings.
+
+        Args:
+            monitor: Monitor information.
+
+        Returns:
+            First 16 characters of SHA256 hash.
+        """
+        settings = f"{self.radius}:{monitor.transform}:{monitor.scale}x{monitor.width}x{monitor.height}"
+        return hashlib.sha256(settings.encode()).hexdigest()[:16]
+
+    def build_key(self, monitor: MonitorInfo, image_path: str) -> str:
         """Build the cache key for the image.
+
+        Uses dual-hash format: {source_hash}_{settings_hash}
+        This allows identifying orphaned cache files by source hash.
 
         Args:
             monitor: Monitor information
             image_path: Path to the source image
-        """
-        return f"{monitor.transform}:{monitor.scale}x{monitor.width}x{monitor.height}:{image_path}"
 
-    def get_path(self, key: str) -> str:
-        """Get the path for a given key.
-
-        Args:
-            key: Cache key
+        Returns:
+            Cache key in format: {source_hash}_{settings_hash}
         """
-        return str(Path(self.tmpdir) / f"{abs(hash((key, self.radius)))}.{IMAGE_FORMAT}")
+        source_hash = self.hash_source(image_path)
+        settings_hash = self._hash_settings(monitor)
+        return f"{source_hash}_{settings_hash}"
 
     def scale_and_round(self, src: str, monitor: MonitorInfo) -> str:
         """Scale and round the image for the given monitor.
@@ -88,26 +142,36 @@ class RoundedImageManager:
         Args:
             src: Source image path
             monitor: Monitor information
+
+        Returns:
+            Path to the cached rounded image.
         """
-        key = self._build_key(monitor, src)
-        dest = self.get_path(key)
-        if not os.path.exists(dest):
-            with Image.open(src) as img:
-                is_rotated = monitor.transform % 2
-                width, height = (monitor.width, monitor.height) if not is_rotated else (monitor.height, monitor.width)
-                width = int(width / monitor.scale)
-                height = int(height / monitor.scale)
-                resample = Image.Resampling.LANCZOS
-                resized = ImageOps.fit(img, (width, height), method=resample)
+        key = self.build_key(monitor, src)
 
-                scale = 4
-                mask = self._create_rounded_mask(resized.width, resized.height, scale, resample)
+        # Check cache for valid entry
+        cached = self.cache.get(key, IMAGE_FORMAT)
+        if cached:
+            return str(cached)
 
-                result = Image.new("RGB", resized.size, "black")
-                result.paste(resized.convert("RGB"), mask=mask)
-                result.convert("RGB").save(dest)
+        # Get path for new cache entry
+        dest = self.cache.get_path(key, IMAGE_FORMAT)
 
-        return dest
+        with Image.open(src) as img:
+            is_rotated = monitor.transform % 2
+            width, height = (monitor.width, monitor.height) if not is_rotated else (monitor.height, monitor.width)
+            width = int(width / monitor.scale)
+            height = int(height / monitor.scale)
+            resample = Image.Resampling.LANCZOS
+            resized = ImageOps.fit(img, (width, height), method=resample)
+
+            scale = 4
+            mask = self._create_rounded_mask(resized.width, resized.height, scale, resample)
+
+            result = Image.new("RGB", resized.size, "black")
+            result.paste(resized.convert("RGB"), mask=mask)
+            result.convert("RGB").save(str(dest))
+
+        return str(dest)
 
     def _create_rounded_mask(self, width: int, height: int, scale: int, resample: Image.Resampling) -> Image.Image:
         """Create a rounded mask.

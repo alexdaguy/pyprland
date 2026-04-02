@@ -9,21 +9,20 @@ import sys
 from typing import TextIO
 
 __all__ = [
-    # Detection
-    "should_colorize",
-    # Constants
-    "RESET",
-    "BOLD",
-    "DIM",
     "BLACK",
+    "BLUE",
+    "BOLD",
+    "CYAN",
+    "DIM",
+    "GREEN",
     "RED",
+    "RESET",
     "YELLOW",
-    # Helpers
+    "HandlerStyles",
+    "LogStyles",
     "colorize",
     "make_style",
-    # Style classes
-    "LogStyles",
-    "HandlerStyles",
+    "should_colorize",
 ]
 
 # ANSI escape sequence prefix
@@ -39,7 +38,10 @@ DIM = "2"
 # Foreground color codes
 BLACK = "30"
 RED = "31"
+GREEN = "32"
 YELLOW = "33"
+BLUE = "34"
+CYAN = "36"
 
 
 def should_colorize(stream: TextIO | None = None) -> bool:
